@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import torch
 
-from model import HandwrittenCNN
+from model import HandwrittenCNN, HCCR9Layer, create_model
+
+
+def test_hccr9layer_returns_logits_for_96px_input() -> None:
+    model = HCCR9Layer(num_classes=7)
+    outputs = model(torch.randn(1, 1, 96, 96))
+    assert outputs.shape == (1, 7)
+
+
+def test_model_factory_builds_paper_model() -> None:
+    assert isinstance(create_model("hccr_cnn9", 7), HCCR9Layer)
 
 
 def test_handwritten_cnn_returns_logits_for_each_class() -> None:

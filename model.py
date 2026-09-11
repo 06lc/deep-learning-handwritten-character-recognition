@@ -1,8 +1,29 @@
-"""用于 HWDB-1.1 单字符分类的轻量残差卷积网络。"""
+"""识别模型定义和模型工厂。"""
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from torch import Tensor, nn
+from torch.nn import functional as F
+
+
+class SafeBatchNorm1d(nn.BatchNorm1d):
+    """论文的 BN；batch=1 时使用运行统计，避免单样本烟测崩溃。"""
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        if self.training and inputs.shape[0] == 1:
+            return F.batch_norm(
+                inputs,
+                self.running_mean,
+                self.running_var,
+                self.weight,
+                self.bias,
+                False,
+                self.momentum,
+                self.eps,
+            )
+        return super().forward(inputs)
 
 
 class ResidualBlock(nn.Module):
@@ -17,14 +38,14 @@ class ResidualBlock(nn.Module):
             nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
         )
-        self.skip: nn.Module
-        if in_channels == out_channels and stride == 1:
-            self.skip = nn.Identity()
-        else:
-            self.skip = nn.Sequential(
+        self.skip: nn.Module = (
+            nn.Identity()
+            if in_channels == out_channels and stride == 1
+            else nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False),
                 nn.BatchNorm2d(out_channels),
             )
+        )
         self.activation = nn.SiLU(inplace=True)
 
     def forward(self, inputs: Tensor) -> Tensor:
@@ -32,7 +53,7 @@ class ResidualBlock(nn.Module):
 
 
 class HandwrittenCNN(nn.Module):
-    """适合灰度汉字图片的紧凑型深度 CNN。"""
+    """原项目的轻量模型，保留用于旧 checkpoint 兼容。"""
 
     def __init__(self, num_classes: int, dropout: float = 0.2) -> None:
         super().__init__()
@@ -55,18 +76,79 @@ class HandwrittenCNN(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(256, num_classes),
         )
-        self._reset_parameters()
-
-    def _reset_parameters(self) -> None:
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-            elif isinstance(module, nn.BatchNorm2d):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, mean=0.0, std=0.01)
-                nn.init.zeros_(module.bias)
 
     def forward(self, inputs: Tensor) -> Tensor:
         return self.classifier(self.features(inputs))
+
+
+class PaperConvBlock(nn.Module):
+    """论文中的 3x3 卷积、BN、PReLU 组合。"""
+
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.PReLU(out_channels),
+        )
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return self.block(inputs)
+
+
+class HCCR9Layer(nn.Module):
+    """论文 HCCR-CNN9Layer 的 PyTorch 实现。
+
+    论文将 7 个卷积层和 2 个全连接层合称 9-layer CNN。自适应池化保留了
+    96x96 的论文默认输入，同时允许测试使用较小图片。
+    """
+
+    def __init__(self, num_classes: int, dropout: float = 0.5) -> None:
+        super().__init__()
+        if num_classes < 2:
+            raise ValueError("num_classes must be at least 2")
+        self.features = nn.Sequential(
+            PaperConvBlock(1, 96),
+            nn.MaxPool2d(3, stride=2, padding=1),
+            PaperConvBlock(96, 128),
+            nn.MaxPool2d(3, stride=2, padding=1),
+            PaperConvBlock(128, 160),
+            nn.MaxPool2d(3, stride=2, padding=1),
+            PaperConvBlock(160, 256),
+            PaperConvBlock(256, 256),
+            nn.MaxPool2d(3, stride=2, padding=1),
+            PaperConvBlock(256, 384),
+            PaperConvBlock(384, 384),
+            nn.MaxPool2d(3, stride=2, padding=1),
+        )
+        self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool2d((3, 3)),
+            nn.Flatten(),
+            nn.Linear(384 * 3 * 3, 1024),
+            SafeBatchNorm1d(1024),
+            nn.PReLU(1024),
+            nn.Dropout(dropout),
+            nn.Linear(1024, num_classes),
+        )
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return self.classifier(self.features(inputs))
+
+
+def create_model(name: str, num_classes: int) -> nn.Module:
+    """根据 checkpoint/CLI 名称构建模型。"""
+
+    if num_classes < 2:
+        raise ValueError("num_classes must be at least 2")
+    normalized = name.lower().strip().replace("-", "_")
+    if normalized in {"hccr_cnn9", "hccr_cnn9layer", "hccr9"}:
+        return HCCR9Layer(num_classes)
+    if normalized in {"cnn", "handwritten_cnn"}:
+        return HandwrittenCNN(num_classes)
+    raise ValueError(f"unknown model '{name}'; choose hccr_cnn9 or cnn")
+
+
+MODEL_BUILDERS: dict[str, Callable[[int], nn.Module]] = {
+    "hccr_cnn9": HCCR9Layer,
+    "cnn": HandwrittenCNN,
+}

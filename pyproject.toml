@@ -6,10 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "hwdb-recognizer"
 version = "1.0.0"
 description = "Modern PyTorch CASIA-HWDB-1.1 handwritten character recognizer"
-requires-python = ">=3.13,<3.14"
+requires-python = ">=3.12,<3.14"
 dependencies = [
-    "torch>=2.9,<3",
-    "torchvision>=0.24,<1",
+    "torch>=2.8,<2.9",
+    "torchvision>=0.23,<0.24",
     "numpy>=2,<3",
     "Pillow>=10,<13",
 ]
@@ -19,9 +19,13 @@ dev = [
     "pytest>=8,<10",
     "ruff>=0.12,<1",
 ]
+deploy = [
+    "onnx>=1.16,<2",
+    "onnxruntime-gpu>=1.19,<2",
+]
 
 [tool.setuptools]
-py-modules = ["config", "gnt_dataset", "model", "predict", "train", "main"]
+py-modules = ["config", "compression", "gnt_dataset", "model", "predict", "train", "main"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

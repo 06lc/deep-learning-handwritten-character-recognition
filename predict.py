@@ -30,6 +30,10 @@ def predict_image(
         raise ValueError("top_k must be at least 1")
     with Image.open(path) as image:
         tensor = preprocess_image(image, image_size).unsqueeze(0).to(device)
+    try:
+        tensor = tensor.to(dtype=next(model.parameters()).dtype)
+    except StopIteration:
+        pass
     model.eval()
     with torch.inference_mode():
         probabilities = torch.softmax(model(tensor)[0], dim=0)

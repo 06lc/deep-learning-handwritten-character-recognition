@@ -131,9 +131,7 @@ def build_index(
     for file_id, offset, sample_size, width, height, label in raw_records:
         if label not in class_to_idx:
             raise DatasetFormatError(f"unknown label {label!r} in GNT index")
-        records.append(
-            GNTRecord(file_id, offset, sample_size, width, height, class_to_idx[label])
-        )
+        records.append(GNTRecord(file_id, offset, sample_size, width, height, class_to_idx[label]))
     return GNTIndex(files, tuple(records), ordered_classes)
 
 
@@ -260,7 +258,7 @@ class GNTDataset(Dataset[tuple[Tensor, int]]):
     def __init__(
         self,
         index: GNTIndex,
-        image_size: int = 64,
+        image_size: int = 96,
         augment: bool = False,
         record_indices: Sequence[int] | None = None,
     ) -> None:
