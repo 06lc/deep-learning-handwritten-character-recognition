@@ -1,0 +1,11 @@
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.idea/
+cache/
+outputs/
+Gnt1.1Test/
+Gnt1.1TrainPart1/
+Gnt1.1TrainPart2/
+*.pyc
+*.egg-info/
