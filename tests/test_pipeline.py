@@ -5,6 +5,8 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pytest
+import torch
 from PIL import Image
 
 from config import TrainConfig
@@ -89,7 +91,72 @@ def test_fit_evaluate_and_predict_round_trip(tmp_path: Path) -> None:
         config,
         output_dir=tmp_path / "resumed-outputs",
         epochs=2,
+        learning_rate=9e-4,
         resume=checkpoint,
     )
     resumed = fit(resumed_config)
     assert resumed["history"][0]["epoch"] == 2
+
+    source_payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    resumed_payload = torch.load(
+        resumed_config.output_dir / "last.pt", map_location="cpu", weights_only=False
+    )
+    source_optimizer = source_payload["optimizer_state"]
+    resumed_optimizer = resumed_payload["optimizer_state"]
+    assert resumed_optimizer["param_groups"][0]["initial_lr"] == pytest.approx(
+        source_optimizer["param_groups"][0]["initial_lr"]
+    )
+    assert resumed_optimizer["param_groups"][0]["initial_lr"] != pytest.approx(
+        resumed_config.learning_rate
+    )
+    assert resumed_payload["scheduler_state"]["T_max"] == source_payload["scheduler_state"][
+        "T_max"
+    ]
+
+
+def test_finetune_starts_at_epoch_one_with_new_learning_rate(tmp_path: Path) -> None:
+    train_roots, test_root, _ = _make_fixture(tmp_path)
+    source_config = TrainConfig(
+        train_roots=train_roots,
+        test_root=test_root,
+        cache_dir=tmp_path / "cache",
+        output_dir=tmp_path / "source-outputs",
+        image_size=16,
+        batch_size=2,
+        epochs=1,
+        val_fraction=0.5,
+        learning_rate=3e-4,
+        num_workers=0,
+        device="cpu",
+        expected_num_classes=2,
+        patience=1,
+        max_train_batches=1,
+        max_eval_batches=1,
+    )
+    fit(source_config)
+    source_checkpoint = source_config.output_dir / "best.pt"
+    fine_tune_learning_rate = 1e-5
+    fine_tune_config = replace(
+        source_config,
+        output_dir=tmp_path / "finetune-outputs",
+        learning_rate=fine_tune_learning_rate,
+        finetune_from=source_checkpoint,
+    )
+
+    result = fit(fine_tune_config)
+
+    payload = torch.load(
+        fine_tune_config.output_dir / "last.pt", map_location="cpu", weights_only=False
+    )
+    assert result["history"][0]["epoch"] == 1
+    assert payload["epoch"] == 1
+    assert payload["optimizer_state"]["param_groups"][0]["initial_lr"] == pytest.approx(
+        fine_tune_learning_rate
+    )
+    assert payload["scheduler_state"]["base_lrs"] == pytest.approx(
+        [fine_tune_learning_rate]
+    )
+    assert payload["finetune_source"] == {
+        "checkpoint": str(source_checkpoint.resolve()),
+        "epoch": 1,
+    }

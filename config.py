@@ -49,6 +49,7 @@ class TrainConfig:
     batch_size: int = 128
     epochs: int = 30
     val_fraction: float = 0.1
+    # AdamW 的初始学习率；Cosine 调度器会在每轮后逐步降低它。
     learning_rate: float = 3e-4
     weight_decay: float = 1e-4
     label_smoothing: float = 0.05
@@ -61,14 +62,20 @@ class TrainConfig:
     expected_num_classes: int | None = 3926
     rebuild_index: bool = False
     resume: Path | None = None
+    finetune_from: Path | None = None
     max_train_batches: int | None = None
     max_eval_batches: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.resume is not None and self.finetune_from is not None:
+            raise ValueError("resume and finetune_from cannot be used together")
 
     def as_dict(self) -> dict[str, Any]:
         values = asdict(self)
         values["train_roots"] = [str(path) for path in self.train_roots]
         for key in ("test_root", "cache_dir", "output_dir"):
             values[key] = str(values[key])
-        if self.resume is not None:
-            values["resume"] = str(self.resume)
+        for key in ("resume", "finetune_from"):
+            if values[key] is not None:
+                values[key] = str(values[key])
         return values

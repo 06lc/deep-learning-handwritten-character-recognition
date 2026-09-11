@@ -54,6 +54,7 @@ def _add_train_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--val-fraction", type=float, default=0.1)
+    # 初始学习率；需要微调时使用更小值并从 checkpoint 重新建立优化器。
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--label-smoothing", type=float, default=0.05)
@@ -64,7 +65,17 @@ def _add_train_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--expected-num-classes", type=int, default=3926)
     parser.add_argument("--rebuild-index", action="store_true")
-    parser.add_argument("--resume", type=Path)
+    checkpoint_group = parser.add_mutually_exclusive_group()
+    checkpoint_group.add_argument(
+        "--resume",
+        type=Path,
+        help="resume model, optimizer, scheduler, AMP scaler and epoch",
+    )
+    checkpoint_group.add_argument(
+        "--finetune-from",
+        type=Path,
+        help="load only model weights and class mapping for a new fine-tuning run",
+    )
     parser.add_argument("--max-train-batches", type=int)
     parser.add_argument("--max-eval-batches", type=int)
 
@@ -193,6 +204,7 @@ def _run_train(args: argparse.Namespace) -> int:
         expected_num_classes=args.expected_num_classes,
         rebuild_index=args.rebuild_index,
         resume=args.resume,
+        finetune_from=args.finetune_from,
         max_train_batches=args.max_train_batches,
         max_eval_batches=args.max_eval_batches,
     )

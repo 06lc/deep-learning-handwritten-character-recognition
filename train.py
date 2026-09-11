@@ -167,8 +167,12 @@ def run_epoch(
 def _optimizer_and_scheduler(
     model: nn.Module, config: TrainConfig
 ) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler]:
-    if config.recipe.lower() == "paper":
-        optimizer: torch.optim.Optimizer = torch.optim.SGD(
+    if config.finetune_from is not None:
+        optimizer: torch.optim.Optimizer = torch.optim.AdamW(
+            model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+        )
+    elif config.recipe.lower() == "paper":
+        optimizer = torch.optim.SGD(
             model.parameters(),
             lr=0.01,
             momentum=0.9,
@@ -176,11 +180,13 @@ def _optimizer_and_scheduler(
             weight_decay=config.weight_decay,
         )
     elif config.recipe.lower() == "modern":
+        # 现代默认方案从 3e-4 起步；微调应通过新建 optimizer 使用更小学习率。
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
         )
     else:
         raise ValueError("recipe must be 'modern' or 'paper'")
+    # 按总训练轮数做余弦退火，避免后期学习率过大破坏已学到的笔画特征。
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, config.epochs))
     return optimizer, scheduler
 
@@ -266,6 +272,7 @@ def fit(config: TrainConfig) -> dict[str, object]:
     best_top1 = -1.0
     stale_epochs = 0
     start_epoch = 1
+    finetune_source: dict[str, object] | None = None
     if config.resume is not None:
         resume_payload = torch.load(config.resume, map_location=device, weights_only=False)
         if tuple(resume_payload.get("class_names", ())) != train_index.class_names:
@@ -279,6 +286,22 @@ def fit(config: TrainConfig) -> dict[str, object]:
             scaler.load_state_dict(resume_payload["scaler_state"])
         start_epoch = int(resume_payload.get("epoch", 0)) + 1
         best_top1 = float(resume_payload.get("metrics", {}).get("top1", -1.0))
+    elif config.finetune_from is not None:
+        source = config.finetune_from.resolve()
+        finetune_payload = torch.load(source, map_location=device, weights_only=False)
+        if tuple(finetune_payload.get("class_names", ())) != train_index.class_names:
+            raise ValueError("fine-tune checkpoint class mapping differs from current data")
+        source_model_name = str(finetune_payload.get("model_name", "cnn"))
+        if source_model_name != config.model_name:
+            raise ValueError(
+                "fine-tune checkpoint model differs from configured model: "
+                f"{source_model_name!r} != {config.model_name!r}"
+            )
+        model.load_state_dict(finetune_payload["model_state"])
+        finetune_source = {
+            "checkpoint": str(source),
+            "epoch": int(finetune_payload.get("epoch", 0)),
+        }
 
     for epoch in range(start_epoch, config.epochs + 1):
         train_metrics = run_epoch(
@@ -306,6 +329,7 @@ def fit(config: TrainConfig) -> dict[str, object]:
             train_index.class_names,
             epoch,
             validation_metrics,
+            extra={"finetune_source": finetune_source} if finetune_source else None,
         )
         if validation_metrics["top1"] > best_top1:
             best_top1 = validation_metrics["top1"]
@@ -320,6 +344,7 @@ def fit(config: TrainConfig) -> dict[str, object]:
                 train_index.class_names,
                 epoch,
                 validation_metrics,
+                extra={"finetune_source": finetune_source} if finetune_source else None,
             )
         else:
             stale_epochs += 1
@@ -335,6 +360,8 @@ def fit(config: TrainConfig) -> dict[str, object]:
         "best_validation_top1": best_top1,
         "history": history,
     }
+    if finetune_source is not None:
+        result["finetune_source"] = finetune_source
     (config.output_dir / "history.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
     )
