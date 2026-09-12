@@ -8,10 +8,12 @@ import pytest
 import torch
 
 from config import TrainConfig
+from gnt_dataset import build_index
 from model import create_model
 from train import (
     ExponentialMovingAverage,
     _optimizer_and_scheduler,
+    class_balanced_sample_weights,
     load_checkpoint,
     prepare_indexes,
 )
@@ -107,3 +109,32 @@ def test_old_checkpoint_without_preprocessing_remains_loadable(tmp_path: Path) -
 
     assert "preprocessing" not in payload
     assert restored(torch.randn(1, 1, 16, 16)).shape == (1, 2)
+
+
+def test_class_balanced_weights_protect_rare_classes_with_cap(tmp_path: Path) -> None:
+    root = tmp_path / "train"
+    root.mkdir()
+    _write_one_record(root / "rare.gnt", "A")
+    for index in range(5):
+        _write_one_record(root / f"common-{index}.gnt", "B")
+    dataset_index = build_index(root)
+    record_indices = list(range(len(dataset_index.records)))
+
+    weights = class_balanced_sample_weights(dataset_index, record_indices)
+
+    rare_label = dataset_index.class_names.index("A")
+    rare_position = next(
+        position
+        for position, record_index in enumerate(record_indices)
+        if dataset_index.records[record_index].label == rare_label
+    )
+    common_positions = [
+        position
+        for position, record_index in enumerate(record_indices)
+        if dataset_index.records[record_index].label != rare_label
+    ]
+    assert float(weights.max()) <= 2.0
+    assert all(
+        float(weights[rare_position]) > float(weights[position])
+        for position in common_positions
+    )

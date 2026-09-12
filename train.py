@@ -11,7 +11,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch import Tensor, nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from compression import dequantize_state_dict, replace_conv_with_gslre
 from config import TrainConfig
@@ -21,6 +21,7 @@ from gnt_dataset import (
     build_index,
     gnt_files,
     load_index,
+    merge_indexes,
     save_index,
     split_record_indices_by_file,
 )
@@ -69,24 +70,35 @@ class ExponentialMovingAverage:
         self.model.load_state_dict(state)
 
 
-def prepare_indexes(config: TrainConfig) -> tuple[GNTIndex, GNTIndex]:
-    """加载缓存索引，或扫描当前配置的 GNT 文件。"""
+def _index_matches(
+    index: GNTIndex,
+    files: tuple[Path, ...],
+    class_names: tuple[str, ...] | None = None,
+    expected_num_classes: int | None = None,
+) -> bool:
+    return (
+        index.files == files
+        and (class_names is None or index.class_names == class_names)
+        and (expected_num_classes is None or len(index.class_names) == expected_num_classes)
+    )
 
+
+def _prepare_primary_indexes(config: TrainConfig) -> tuple[GNTIndex, GNTIndex]:
     train_cache = config.cache_dir / "train.npz"
     test_cache = config.cache_dir / "test.npz"
-    if not config.rebuild_index and train_cache.is_file() and test_cache.is_file():
+    expected_train_files = gnt_files(config.train_roots)
+    expected_test_files = gnt_files(config.test_root)
+    rebuild_primary = config.rebuild_index and config.data_profile == "hwdb11"
+    if not rebuild_primary and train_cache.is_file() and test_cache.is_file():
         train_index = load_index(train_cache)
         test_index = load_index(test_cache)
-        expected_train_files = gnt_files(config.train_roots)
-        expected_test_files = gnt_files(config.test_root)
         cache_matches = (
-            train_index.files == expected_train_files
-            and test_index.files == expected_test_files
-            and test_index.class_names == train_index.class_names
-            and (
-                config.expected_num_classes is None
-                or len(train_index.class_names) == config.expected_num_classes
+            _index_matches(
+                train_index,
+                expected_train_files,
+                expected_num_classes=config.expected_num_classes,
             )
+            and _index_matches(test_index, expected_test_files, train_index.class_names)
         )
         if cache_matches:
             return train_index, test_index
@@ -98,6 +110,128 @@ def prepare_indexes(config: TrainConfig) -> tuple[GNTIndex, GNTIndex]:
     return train_index, test_index
 
 
+def _data_report(
+    config: TrainConfig,
+    primary: GNTIndex,
+    train_index: GNTIndex,
+    test_index: GNTIndex,
+) -> dict[str, object]:
+    additional_files = len(train_index.files) - len(primary.files)
+    stats = train_index.filter_stats if config.data_profile == "hwdb10_11_shared" else None
+    shared_class_names = set(stats.shared_class_names) if stats else set(primary.class_names)
+    return {
+        "data_profile": config.data_profile,
+        "primary_train_roots": [str(path.resolve()) for path in config.train_roots],
+        "additional_train_roots": (
+            [str(path.resolve()) for path in config.additional_train_roots]
+            if config.data_profile == "hwdb10_11_shared"
+            else []
+        ),
+        "primary_train_files": len(primary.files),
+        "additional_train_files": additional_files,
+        "primary_samples": len(primary.records),
+        "additional_scanned_samples": stats.scanned_samples if stats else 0,
+        "additional_accepted_samples": stats.accepted_samples if stats else 0,
+        "additional_excluded_samples": stats.excluded_samples if stats else 0,
+        "shared_classes": len(stats.shared_class_names) if stats else len(primary.class_names),
+        "primary_only_class_names": [
+            name for name in primary.class_names if name not in shared_class_names
+        ],
+        "excluded_classes": len(stats.excluded_class_names) if stats else 0,
+        "excluded_class_names": list(stats.excluded_class_names) if stats else [],
+        "canonical_class_mapping_source": "HWDB1.1 training index",
+        "num_classes": len(train_index.class_names),
+        "test_samples": len(test_index.records),
+    }
+
+
+def _ensure_disjoint_sources(train_index: GNTIndex, test_index: GNTIndex) -> None:
+    train_files = {path.resolve() for path in train_index.files}
+    test_files = {path.resolve() for path in test_index.files}
+    overlap = train_files.intersection(test_files)
+    if overlap:
+        raise ValueError(f"training and test indexes overlap: {sorted(overlap)!r}")
+
+
+def prepare_indexes_with_report(
+    config: TrainConfig,
+) -> tuple[GNTIndex, GNTIndex, dict[str, object]]:
+    """准备主数据或兼容扩充数据，并返回可写入 checkpoint 的来源报告。"""
+
+    primary, test_index = _prepare_primary_indexes(config)
+    if config.data_profile == "hwdb11":
+        _ensure_disjoint_sources(primary, test_index)
+        return primary, test_index, _data_report(config, primary, primary, test_index)
+
+    additional_files = gnt_files(config.additional_train_roots)
+    combined_files = primary.files + additional_files
+    shared_cache = config.cache_dir / "train_hwdb10_11_shared.npz"
+    train_index: GNTIndex | None = None
+    if not config.rebuild_index and shared_cache.is_file():
+        cached = load_index(shared_cache)
+        if (
+            _index_matches(cached, combined_files, primary.class_names)
+            and cached.filter_stats is not None
+        ):
+            train_index = cached
+    if train_index is None:
+        additional = build_index(
+            config.additional_train_roots,
+            class_names=primary.class_names,
+            expected_num_classes=len(primary.class_names),
+            unknown_label="skip",
+        )
+        train_index = merge_indexes(primary, additional)
+        save_index(train_index, shared_cache)
+    _ensure_disjoint_sources(train_index, test_index)
+    return train_index, test_index, _data_report(config, primary, train_index, test_index)
+
+
+def prepare_indexes(config: TrainConfig) -> tuple[GNTIndex, GNTIndex]:
+    """兼容旧调用方，只返回训练索引和 HWDB1.1 测试索引。"""
+
+    train_index, test_index, _ = prepare_indexes_with_report(config)
+    return train_index, test_index
+
+
+def prepare_test_index(
+    config: TrainConfig, class_names: tuple[str, ...]
+) -> tuple[GNTIndex, dict[str, object]]:
+    """按测试配置准备独立测试索引，不与训练或验证指标混合。"""
+
+    if config.test_profile == "hwdb11":
+        _, test_index = _prepare_primary_indexes(config)
+        if test_index.class_names != class_names:
+            raise ValueError("HWDB1.1 test labels do not match checkpoint class mapping")
+    else:
+        cache_path = config.cache_dir / "test_hwdb10_shared.npz"
+        expected_files = gnt_files(config.hwdb10_test_root)
+        test_index = None
+        if not config.rebuild_index and cache_path.is_file():
+            cached = load_index(cache_path)
+            if (
+                _index_matches(cached, expected_files, class_names)
+                and cached.filter_stats is not None
+            ):
+                test_index = cached
+        if test_index is None:
+            test_index = build_index(
+                config.hwdb10_test_root,
+                class_names=class_names,
+                expected_num_classes=len(class_names),
+                unknown_label="skip",
+            )
+            save_index(test_index, cache_path)
+    stats = test_index.filter_stats
+    return test_index, {
+        "test_profile": config.test_profile,
+        "test_scanned_samples": stats.scanned_samples if stats else len(test_index.records),
+        "test_accepted_samples": stats.accepted_samples if stats else len(test_index.records),
+        "test_excluded_samples": stats.excluded_samples if stats else 0,
+        "test_excluded_class_names": list(stats.excluded_class_names) if stats else [],
+    }
+
+
 def make_loader(
     dataset: GNTDataset,
     batch_size: int,
@@ -105,17 +239,48 @@ def make_loader(
     num_workers: int,
     device: torch.device,
     seed: int,
+    sample_weights: Tensor | None = None,
 ) -> DataLoader[tuple[Tensor, Tensor]]:
     generator = torch.Generator().manual_seed(seed)
+    sampler = None
+    if sample_weights is not None:
+        sampler = WeightedRandomSampler(
+            sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True,
+            generator=generator,
+        )
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle and sampler is None,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
         persistent_workers=num_workers > 0,
         generator=generator,
     )
+
+
+def class_balanced_sample_weights(
+    index: GNTIndex,
+    record_indices: list[int],
+    max_multiplier: float = 2.0,
+) -> Tensor:
+    """按类别逆频率生成采样权重，并限制稀有类别的最大倍率。"""
+
+    if max_multiplier < 1:
+        raise ValueError("max_multiplier must be at least 1")
+    counts = torch.zeros(len(index.class_names), dtype=torch.long)
+    labels = torch.tensor([index.records[i].label for i in record_indices], dtype=torch.long)
+    counts.scatter_add_(0, labels, torch.ones_like(labels))
+    present = counts > 0
+    if not bool(present.any()):
+        raise ValueError("record_indices contains no samples")
+    mean_count = counts[present].double().mean()
+    class_weights = torch.ones(len(index.class_names), dtype=torch.double)
+    class_weights[present] = (mean_count / counts[present].double()).clamp(max=max_multiplier)
+    return class_weights[labels]
 
 
 def make_train_validation_loaders(
@@ -143,8 +308,19 @@ def make_train_validation_loaders(
         record_indices=validation_indices,
         preprocess_profile=config.preprocess_profile,
     )
+    sample_weights = None
+    if config.sampling_strategy == "class-balanced":
+        sample_weights = class_balanced_sample_weights(index, train_indices)
     return (
-        make_loader(train_set, config.batch_size, True, config.num_workers, device, config.seed),
+        make_loader(
+            train_set,
+            config.batch_size,
+            True,
+            config.num_workers,
+            device,
+            config.seed,
+            sample_weights,
+        ),
         make_loader(validation_set, config.batch_size, False, config.num_workers, device, 0),
     )
 
@@ -362,7 +538,16 @@ def load_checkpoint(
 def fit(config: TrainConfig) -> dict[str, object]:
     seed_everything(config.seed)
     device = resolve_device(config.device)
-    train_index, _ = prepare_indexes(config)
+    train_index, _, data_report = prepare_indexes_with_report(config)
+    if config.data_profile == "hwdb10_11_shared" and not (
+        config.finetune_from or config.resume
+    ):
+        raise ValueError(
+            "hwdb10_11_shared must start with --finetune-from; "
+            "--resume is accepted only for its own interrupted run"
+        )
+    if config.data_profile == "hwdb10_11_shared" and config.warm_start_from is not None:
+        raise ValueError("hwdb10_11_shared does not support --warm-start-from")
     train_loader, validation_loader = make_train_validation_loaders(train_index, config, device)
     model = create_model(config.model_name, len(train_index.class_names)).to(device)
     source_path = config.resume or config.finetune_from or config.warm_start_from
@@ -375,6 +560,15 @@ def fit(config: TrainConfig) -> dict[str, object]:
         source_payload = torch.load(resolved_source, map_location=device, weights_only=False)
         if tuple(source_payload.get("class_names", ())) != train_index.class_names:
             raise ValueError("checkpoint class mapping differs from current data")
+        if (
+            config.data_profile == "hwdb10_11_shared"
+            and config.resume is not None
+            and source_payload.get("data_profile") != "hwdb10_11_shared"
+        ):
+            raise ValueError(
+                "expanded training may resume only a hwdb10_11_shared checkpoint; "
+                "use --finetune-from for the HWDB1.1 baseline"
+            )
         source_metadata = {
             "checkpoint": str(resolved_source),
             "epoch": int(source_payload.get("epoch", 0)),
@@ -426,7 +620,7 @@ def fit(config: TrainConfig) -> dict[str, object]:
         start_epoch = int(source_payload.get("epoch", 0)) + 1
         best_top1 = float(source_payload.get("metrics", {}).get("top1", -1.0))
 
-    checkpoint_extra: dict[str, Any] = {}
+    checkpoint_extra: dict[str, Any] = dict(data_report)
     if config.finetune_from is not None:
         checkpoint_extra["finetune_source"] = source_metadata
     if config.warm_start_from is not None:
@@ -508,7 +702,12 @@ def fit(config: TrainConfig) -> dict[str, object]:
         "validation_weight_source": "ema" if ema is not None else "raw",
         "history": history,
     }
-    result.update(checkpoint_extra)
+    result.update(data_report)
+    if config.finetune_from is not None:
+        result["finetune_source"] = source_metadata
+    if config.warm_start_from is not None:
+        result["warm_start_source"] = source_metadata
+        result["warm_start_report"] = warm_start_report
     (config.output_dir / "history.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -517,7 +716,7 @@ def fit(config: TrainConfig) -> dict[str, object]:
 
 def evaluate_checkpoint(
     checkpoint: str | Path, config: TrainConfig, output_dir: str | Path | None = None
-) -> dict[str, float]:
+) -> dict[str, object]:
     device = resolve_device(config.device)
     model, payload = load_checkpoint(checkpoint, device)
     class_names = tuple(payload["class_names"])
@@ -525,6 +724,7 @@ def evaluate_checkpoint(
     test_config = TrainConfig(
         train_roots=config.train_roots,
         test_root=config.test_root,
+        hwdb10_test_root=config.hwdb10_test_root,
         cache_dir=config.cache_dir,
         output_dir=config.output_dir,
         model_name=str(payload.get("model_name", "cnn")),
@@ -536,10 +736,9 @@ def evaluate_checkpoint(
         ),
         expected_num_classes=len(class_names),
         rebuild_index=config.rebuild_index,
+        test_profile=config.test_profile,
     )
-    _, test_index = prepare_indexes(test_config)
-    if test_index.class_names != class_names:
-        raise ValueError("test labels do not match checkpoint class mapping")
+    test_index, test_report = prepare_test_index(test_config, class_names)
     test_set = GNTDataset(
         test_index,
         image_size=test_config.image_size,
@@ -548,7 +747,10 @@ def evaluate_checkpoint(
     loader = make_loader(test_set, config.batch_size, False, config.num_workers, device, 0)
     criterion = nn.CrossEntropyLoss()
     with torch.inference_mode():
-        metrics = run_epoch(model, loader, criterion, device, max_batches=config.max_eval_batches)
+        metrics: dict[str, object] = run_epoch(
+            model, loader, criterion, device, max_batches=config.max_eval_batches
+        )
+    metrics.update(test_report)
     destination = Path(output_dir) if output_dir else Path(checkpoint).parent / "evaluation"
     destination.mkdir(parents=True, exist_ok=True)
     (destination / "metrics.json").write_text(

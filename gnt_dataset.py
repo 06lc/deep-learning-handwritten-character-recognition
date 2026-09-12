@@ -6,7 +6,7 @@ import json
 import random
 import struct
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import BinaryIO
 
@@ -38,12 +38,27 @@ class GNTRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class GNTIndexStats:
+    """一次索引扫描的接纳与标签过滤统计。"""
+
+    scanned_samples: int
+    accepted_samples: int
+    excluded_samples: int
+    shared_class_names: tuple[str, ...]
+    excluded_class_names: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
 class GNTIndex:
     """GNT 文件路径、类别名称和所有样本记录。"""
 
     files: tuple[Path, ...]
     records: tuple[GNTRecord, ...]
     class_names: tuple[str, ...]
+    filter_stats: GNTIndexStats | None = None
 
 
 def decode_label(raw_label: bytes) -> str:
@@ -85,12 +100,27 @@ def build_index(
     roots: Sequence[str | Path],
     class_names: Sequence[str] | None = None,
     expected_num_classes: int | None = None,
+    *,
+    unknown_label: str = "error",
 ) -> GNTIndex:
     """扫描 GNT 记录头并建立可复用索引，不读取像素正文。"""
 
+    if unknown_label not in {"error", "skip"}:
+        raise ValueError("unknown_label must be 'error' or 'skip'")
     files = gnt_files(roots)
     raw_records: list[tuple[int, int, int, int, int, str]] = []
     discovered_labels: set[str] = set()
+    accepted_labels: set[str] = set()
+    excluded_labels: set[str] = set()
+    excluded_samples = 0
+    ordered_classes = tuple(class_names) if class_names is not None else None
+    if ordered_classes is not None and len(set(ordered_classes)) != len(ordered_classes):
+        raise DatasetFormatError("class_names contains duplicate labels")
+    class_to_idx = (
+        {name: index for index, name in enumerate(ordered_classes)}
+        if ordered_classes is not None
+        else None
+    )
 
     for file_id, path in enumerate(files):
         file_size = path.stat().st_size
@@ -111,16 +141,20 @@ def build_index(
                 if end_offset > file_size:
                     raise DatasetFormatError(f"truncated GNT sample: {path} at {offset}")
                 label = decode_label(raw_label)
-                raw_records.append((file_id, offset, sample_size, width, height, label))
                 discovered_labels.add(label)
+                if class_to_idx is not None and label not in class_to_idx:
+                    if unknown_label == "error":
+                        raise DatasetFormatError(f"unknown label {label!r} in GNT index")
+                    excluded_samples += 1
+                    excluded_labels.add(label)
+                else:
+                    raw_records.append((file_id, offset, sample_size, width, height, label))
+                    accepted_labels.add(label)
                 handle.seek(pixel_size, 1)
 
-    if class_names is None:
+    if ordered_classes is None:
         ordered_classes = tuple(sorted(discovered_labels, key=_label_sort_key))
-    else:
-        ordered_classes = tuple(class_names)
-        if len(set(ordered_classes)) != len(ordered_classes):
-            raise DatasetFormatError("class_names contains duplicate labels")
+        accepted_labels = discovered_labels
 
     if expected_num_classes is not None and len(ordered_classes) != expected_num_classes:
         raise DatasetFormatError(
@@ -130,10 +164,43 @@ def build_index(
     class_to_idx = {name: index for index, name in enumerate(ordered_classes)}
     records: list[GNTRecord] = []
     for file_id, offset, sample_size, width, height, label in raw_records:
-        if label not in class_to_idx:
-            raise DatasetFormatError(f"unknown label {label!r} in GNT index")
         records.append(GNTRecord(file_id, offset, sample_size, width, height, class_to_idx[label]))
-    return GNTIndex(files, tuple(records), ordered_classes)
+    stats = GNTIndexStats(
+        scanned_samples=len(raw_records) + excluded_samples,
+        accepted_samples=len(records),
+        excluded_samples=excluded_samples,
+        shared_class_names=tuple(sorted(accepted_labels, key=_label_sort_key)),
+        excluded_class_names=tuple(sorted(excluded_labels, key=_label_sort_key)),
+    )
+    return GNTIndex(files, tuple(records), ordered_classes, stats)
+
+
+def merge_indexes(primary: GNTIndex, additional: GNTIndex) -> GNTIndex:
+    """合并相同类别映射的索引，并重排附加记录的文件编号。"""
+
+    if primary.class_names != additional.class_names:
+        raise DatasetFormatError("cannot merge GNT indexes with different class mappings")
+    primary_files = {path.resolve() for path in primary.files}
+    if primary_files.intersection(path.resolve() for path in additional.files):
+        raise DatasetFormatError("cannot merge GNT indexes containing the same source file")
+    file_offset = len(primary.files)
+    records = primary.records + tuple(
+        GNTRecord(
+            record.file_id + file_offset,
+            record.offset,
+            record.sample_size,
+            record.width,
+            record.height,
+            record.label,
+        )
+        for record in additional.records
+    )
+    return GNTIndex(
+        primary.files + additional.files,
+        records,
+        primary.class_names,
+        additional.filter_stats,
+    )
 
 
 def save_index(index: GNTIndex, path: str | Path) -> None:
@@ -155,11 +222,15 @@ def save_index(index: GNTIndex, path: str | Path) -> None:
         ],
         dtype=np.int64,
     )
+    stats_json = ""
+    if index.filter_stats is not None:
+        stats_json = json.dumps(index.filter_stats.as_dict(), ensure_ascii=False)
     np.savez_compressed(
         destination,
         files=np.asarray([str(path) for path in index.files], dtype=np.str_),
         class_names=np.asarray(index.class_names, dtype=np.str_),
         records=records,
+        filter_stats=np.asarray(stats_json, dtype=np.str_),
     )
 
 
@@ -173,10 +244,21 @@ def load_index(path: str | Path) -> GNTIndex:
         files = tuple(Path(value) for value in payload["files"].tolist())
         class_names = tuple(str(value) for value in payload["class_names"].tolist())
         raw_records = np.asarray(payload["records"], dtype=np.int64)
+        stats_json = str(payload["filter_stats"].item()) if "filter_stats" in payload else ""
     if raw_records.ndim != 2 or raw_records.shape[1] != 6:
         raise DatasetFormatError(f"invalid index record array: {source}")
     records = tuple(GNTRecord(*(int(value) for value in row)) for row in raw_records)
-    return GNTIndex(files, records, class_names)
+    stats = None
+    if stats_json:
+        raw_stats = json.loads(stats_json)
+        stats = GNTIndexStats(
+            scanned_samples=int(raw_stats["scanned_samples"]),
+            accepted_samples=int(raw_stats["accepted_samples"]),
+            excluded_samples=int(raw_stats["excluded_samples"]),
+            shared_class_names=tuple(raw_stats["shared_class_names"]),
+            excluded_class_names=tuple(raw_stats["excluded_class_names"]),
+        )
+    return GNTIndex(files, records, class_names, stats)
 
 
 def split_record_indices_by_file(
@@ -194,18 +276,30 @@ def split_record_indices_by_file(
     file_ids = list(range(len(index.files)))
     if len(file_ids) < 2:
         raise DatasetFormatError("at least two GNT files are required for validation")
-    validation_count = min(
-        max(1, round(len(file_ids) * validation_fraction)), len(file_ids) - 1
-    )
     rng = random.Random(seed)
     if manifest_path is None:
+        validation_count = min(
+            max(1, round(len(file_ids) * validation_fraction)), len(file_ids) - 1
+        )
         rng.shuffle(file_ids)
         validation_files = set(file_ids[:validation_count])
     else:
         if roots is None:
             raise ValueError("roots are required when using a validation manifest")
+        eligible_files = _file_ids_under_roots(index, roots)
+        if len(eligible_files) < 2:
+            raise DatasetFormatError("at least two primary files are required for validation")
+        validation_count = min(
+            max(1, round(len(eligible_files) * validation_fraction)), len(eligible_files) - 1
+        )
         validation_files = _load_or_create_validation_files(
-            index, roots, Path(manifest_path), validation_count, validation_fraction, seed
+            index,
+            roots,
+            Path(manifest_path),
+            validation_count,
+            validation_fraction,
+            seed,
+            eligible_files,
         )
     train_indices = [
         i for i, record in enumerate(index.records) if record.file_id not in validation_files
@@ -228,6 +322,20 @@ def _portable_file_entry(path: Path, roots: Sequence[Path]) -> dict[str, object]
     raise DatasetFormatError(f"indexed file is outside configured training roots: {path}")
 
 
+def _file_ids_under_roots(index: GNTIndex, roots: Sequence[str | Path]) -> list[int]:
+    resolved_roots = tuple(Path(root).resolve() for root in roots)
+    result: list[int] = []
+    for file_id, path in enumerate(index.files):
+        for root in resolved_roots:
+            try:
+                path.resolve().relative_to(root)
+            except ValueError:
+                continue
+            result.append(file_id)
+            break
+    return result
+
+
 def _load_or_create_validation_files(
     index: GNTIndex,
     roots: Sequence[str | Path],
@@ -235,6 +343,7 @@ def _load_or_create_validation_files(
     validation_count: int,
     validation_fraction: float,
     seed: int,
+    eligible_files: Sequence[int],
 ) -> set[int]:
     resolved_roots = tuple(Path(root).resolve() for root in roots)
     file_lookup = {path.resolve(): file_id for file_id, path in enumerate(index.files)}
@@ -257,11 +366,11 @@ def _load_or_create_validation_files(
             if source not in file_lookup:
                 raise DatasetFormatError(f"validation file is missing from index: {source}")
             validation_files.add(file_lookup[source])
-        if not validation_files or len(validation_files) >= len(index.files):
+        if not validation_files or len(validation_files) >= len(eligible_files):
             raise DatasetFormatError("validation manifest must leave files for training")
         return validation_files
 
-    shuffled = list(range(len(index.files)))
+    shuffled = list(eligible_files)
     random.Random(seed).shuffle(shuffled)
     selected = set(shuffled[:validation_count])
     payload = {

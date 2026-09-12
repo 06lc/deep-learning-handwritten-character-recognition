@@ -25,6 +25,40 @@ def test_cli_exposes_index_train_evaluate_and_predict_commands() -> None:
     assert parser.parse_args(["compress", "--checkpoint", "best.pt"]).command == "compress"
     assert parser.parse_args(["benchmark", "--checkpoint", "best.pt"]).command == "benchmark"
     assert parser.parse_args(["export", "--checkpoint", "best.pt"]).command == "export"
+    assert (
+        parser.parse_args(["index", "--data-profile", "hwdb10_11_shared"]).data_profile
+        == "hwdb10_11_shared"
+    )
+    train_args = parser.parse_args(
+        [
+            "train",
+            "--data-profile",
+            "hwdb10_11_shared",
+            "--sampling-strategy",
+            "class-balanced",
+        ]
+    )
+    assert train_args.data_profile == "hwdb10_11_shared"
+    assert train_args.sampling_strategy == "class-balanced"
+    assert (
+        parser.parse_args(
+            ["evaluate", "--checkpoint", "best.pt", "--test-profile", "hwdb10_shared"]
+        ).test_profile
+        == "hwdb10_shared"
+    )
+    analyze_args = parser.parse_args(
+        [
+            "analyze",
+            "--checkpoint",
+            "best.pt",
+            "--data-profile",
+            "hwdb10_11_shared",
+            "--test-profile",
+            "hwdb10_shared",
+        ]
+    )
+    assert analyze_args.data_profile == "hwdb10_11_shared"
+    assert analyze_args.test_profile == "hwdb10_shared"
 
 
 def test_resume_and_finetune_from_are_mutually_exclusive(

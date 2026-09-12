@@ -11,6 +11,10 @@ HCCR-CNN9Layer：`96x96` 输入、7 个卷积层、PReLU、1024 维全连接层�
 项目目录/Gnt1.1TrainPart1  # 120 个 GNT 文件
 项目目录/Gnt1.1TrainPart2  # 120 个 GNT 文件
 项目目录/Gnt1.1Test        # 60 个 GNT 文件
+项目目录/Gnt1.0TrainPart1  # 112 个 GNT 文件，可选扩充数据
+项目目录/Gnt1.0TrainPart2  # 112 个 GNT 文件，可选扩充数据
+项目目录/Gnt1.0TrainPart3  # 112 个 GNT 文件，可选扩充数据
+项目目录/Gnt1.0Test        # 84 个 GNT 文件，仅作外部测试
 ```
 
 程序通过 `Path(__file__).resolve().parent` 自动定位项目目录，不依赖 `D:\`、`F:\` 或
@@ -40,6 +44,16 @@ python main.py index
 
 首次运行会扫描 300 个 GNT 文件并生成 `cache/train.npz`、`cache/test.npz`。索引只保存文件路径、
 偏移、尺寸和标签，不生成上百万张中间图片。
+
+默认 `--data-profile hwdb11` 完全保持原基线。兼容扩充索引使用 HWDB1.1 的 3926 类
+顺序，过滤 HWDB1.0 独有类别，并保存到独立缓存：
+
+```bash
+python main.py index --data-profile hwdb10_11_shared --rebuild-index
+```
+
+该命令不会覆盖 `cache/train.npz`，扩充索引保存为
+`cache/train_hwdb10_11_shared.npz`。
 
 ## 训练
 
@@ -79,10 +93,32 @@ python main.py train --device cuda --model hccr_cnn9 --image-size 96 --recipe pa
 
 输出位于 `outputs/`：`best.pt`、`last.pt`、`history.json`。
 
+## HWDB1.0 兼容扩充训练
+
+扩充模式同时使用 HWDB1.1 的训练部分和 HWDB1.0 三个 TrainPart 的全部兼容样本；
+固定的 93,887 个 HWDB1.1 验证样本继续只用于验证。首次扩充训练必须从原始最佳模型
+重新建立优化器：
+
+```bash
+python main.py train \
+  --data-profile hwdb10_11_shared \
+  --model hccr_cnn9 \
+  --finetune-from outputs/full/best.pt \
+  --device cuda --epochs 30 --patience 30 \
+  --learning-rate 1e-4 --warmup-epochs 2 \
+  --sampling-strategy natural \
+  --output-dir outputs/data-expansion/d1-warm
+```
+
+`--sampling-strategy class-balanced` 使用逆类别频率采样并把最大倍率限制为 2.0，
+用于保护只存在于 HWDB1.1 的稀有类别。训练中断后可以使用扩充实验自身的
+`last.pt` 配合 `--resume` 恢复；原始 HWDB1.1 基线应使用 `--finetune-from`。
+
 ## 评估和预测
 
 ```bash
 python main.py evaluate --checkpoint outputs/best.pt --device cuda
+python main.py evaluate --checkpoint outputs/best.pt --test-profile hwdb10_shared --device cuda
 python main.py predict --checkpoint outputs/best.pt --input sample-pics/5.jpg --top-k 5
 ```
 

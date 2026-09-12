@@ -12,7 +12,13 @@ from PIL import Image
 
 from config import TrainConfig
 from gnt_dataset import GNTDataset, split_record_indices_by_file
-from train import load_checkpoint, make_loader, prepare_indexes, resolve_device
+from train import (
+    load_checkpoint,
+    make_loader,
+    prepare_indexes,
+    prepare_test_index,
+    resolve_device,
+)
 
 
 def _preprocess_profile(payload: dict[str, Any]) -> str:
@@ -42,9 +48,10 @@ def analyze_checkpoint(
     class_names = tuple(payload["class_names"])
     image_size = int(payload.get("image_size", payload.get("config", {}).get("image_size", 96)))
     profile = _preprocess_profile(payload)
-    train_index, test_index = prepare_indexes(config)
-    if train_index.class_names != class_names or test_index.class_names != class_names:
+    train_index, primary_test_index = prepare_indexes(config)
+    if train_index.class_names != class_names or primary_test_index.class_names != class_names:
         raise ValueError("dataset labels do not match checkpoint class mapping")
+    test_report: dict[str, object] = {}
     if split == "validation":
         assert config.validation_manifest is not None
         _, record_indices = split_record_indices_by_file(
@@ -61,6 +68,7 @@ def analyze_checkpoint(
             preprocess_profile=profile,
         )
     else:
+        test_index, test_report = prepare_test_index(config, class_names)
         dataset = GNTDataset(test_index, image_size, preprocess_profile=profile)
     loader = make_loader(dataset, config.batch_size, False, config.num_workers, device, 0)
 
@@ -134,7 +142,9 @@ def analyze_checkpoint(
         for index, support in enumerate(supports)
         if support > 0
     ]
-    per_class.sort(key=lambda item: (float(item["accuracy"]), -int(item["support"])))
+    hardest_classes = sorted(
+        per_class, key=lambda item: (float(item["accuracy"]), -int(item["support"]))
+    )
     top_confusions = [
         {
             "true_index": truth,
@@ -153,10 +163,12 @@ def analyze_checkpoint(
         "top1": total_top1 / total,
         "top5": total_top5 / total,
         "preprocess_profile": profile,
-        "hardest_classes": per_class[:100],
+        "per_class": per_class,
+        "hardest_classes": hardest_classes[:100],
         "top_confusions": top_confusions,
         "high_confidence_errors": exported_errors,
     }
+    report.update(test_report)
     destination.mkdir(parents=True, exist_ok=True)
     (destination / "analysis.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"

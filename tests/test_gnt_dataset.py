@@ -12,6 +12,7 @@ from gnt_dataset import (
     GNTDataset,
     build_index,
     load_index,
+    merge_indexes,
     preprocess_image,
     save_index,
     split_record_indices_by_file,
@@ -65,6 +66,23 @@ def test_index_round_trip_preserves_records_and_labels(tmp_path: Path) -> None:
     assert restored.class_names == index.class_names
     assert restored.files == index.files
     assert restored.records == index.records
+
+
+def test_legacy_index_without_filter_stats_still_loads(tmp_path: Path) -> None:
+    cache_path = tmp_path / "legacy.npz"
+    records = np.asarray([[0, 0, 14, 2, 2, 0]], dtype=np.int64)
+    np.savez_compressed(
+        cache_path,
+        files=np.asarray([str(tmp_path / "1001-f.gnt")], dtype=np.str_),
+        class_names=np.asarray(["A"], dtype=np.str_),
+        records=records,
+    )
+
+    restored = load_index(cache_path)
+
+    assert restored.class_names == ("A",)
+    assert restored.records[0].label == 0
+    assert restored.filter_stats is None
 
 
 def test_test_label_missing_from_training_mapping_is_rejected(tmp_path: Path) -> None:
@@ -177,3 +195,86 @@ def test_gentle_elastic_augmentation_preserves_shape() -> None:
     )
 
     assert tensor.shape == (1, 96, 96)
+
+
+def test_skip_unknown_labels_and_merge_indexes(tmp_path: Path) -> None:
+    primary_root = tmp_path / "primary"
+    additional_root = tmp_path / "additional"
+    primary_root.mkdir()
+    additional_root.mkdir()
+    image_a = np.full((2, 2), 10, dtype=np.uint8)
+    image_b = np.full((2, 2), 20, dtype=np.uint8)
+    image_c = np.full((2, 2), 30, dtype=np.uint8)
+    _write_gnt(primary_root / "1001-f.gnt", [("A", image_a), ("B", image_b)])
+    _write_gnt(additional_root / "0001-f.gnt", [("B", image_b), ("C", image_c)])
+
+    primary = build_index(primary_root)
+    additional = build_index(
+        additional_root,
+        class_names=primary.class_names,
+        unknown_label="skip",
+    )
+    merged = merge_indexes(primary, additional)
+
+    assert additional.filter_stats is not None
+    assert additional.filter_stats.scanned_samples == 2
+    assert additional.filter_stats.accepted_samples == 1
+    assert additional.filter_stats.excluded_samples == 1
+    assert additional.filter_stats.shared_class_names == ("B",)
+    assert additional.filter_stats.excluded_class_names == ("C",)
+    assert merged.class_names == ("A", "B")
+    assert merged.records[-1].file_id == 1
+    assert merged.records[-1].offset == 0
+    dataset = GNTDataset(merged, image_size=8)
+    assert dataset.raw_image(len(dataset) - 1).tolist() == image_b.tolist()
+    assert dataset[len(dataset) - 1][1] == 1
+
+
+def test_merged_index_round_trip_preserves_filter_stats(tmp_path: Path) -> None:
+    primary_root = tmp_path / "primary"
+    additional_root = tmp_path / "additional"
+    primary_root.mkdir()
+    additional_root.mkdir()
+    image = np.zeros((2, 2), dtype=np.uint8)
+    _write_gnt(primary_root / "1001-f.gnt", [("A", image), ("B", image)])
+    _write_gnt(additional_root / "0001-f.gnt", [("B", image), ("C", image)])
+    primary = build_index(primary_root)
+    additional = build_index(
+        additional_root, class_names=primary.class_names, unknown_label="skip"
+    )
+    merged = merge_indexes(primary, additional)
+    cache = tmp_path / "merged.npz"
+
+    save_index(merged, cache)
+    restored = load_index(cache)
+
+    assert restored.records == merged.records
+    assert restored.filter_stats == additional.filter_stats
+
+
+def test_additional_files_never_enter_fixed_validation(tmp_path: Path) -> None:
+    primary_roots = (tmp_path / "primary-1", tmp_path / "primary-2")
+    additional_root = tmp_path / "additional"
+    for root in (*primary_roots, additional_root):
+        root.mkdir()
+    image = np.zeros((2, 2), dtype=np.uint8)
+    for root_number, root in enumerate(primary_roots):
+        for writer in range(2):
+            _write_gnt(root / f"{root_number}-{writer}.gnt", [("A", image)])
+    _write_gnt(additional_root / "extra.gnt", [("A", image)])
+    primary = build_index(primary_roots)
+    additional = build_index(additional_root, class_names=primary.class_names)
+    merged = merge_indexes(primary, additional)
+
+    train_indices, validation_indices = split_record_indices_by_file(
+        merged,
+        validation_fraction=0.5,
+        seed=42,
+        manifest_path=tmp_path / "validation.json",
+        roots=primary_roots,
+    )
+
+    validation_file_ids = {merged.records[i].file_id for i in validation_indices}
+    training_file_ids = {merged.records[i].file_id for i in train_indices}
+    assert all(file_id < len(primary.files) for file_id in validation_file_ids)
+    assert len(primary.files) in training_file_ids

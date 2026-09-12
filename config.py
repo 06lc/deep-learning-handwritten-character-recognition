@@ -16,9 +16,18 @@ TRAIN_ROOTS = (
     PROJECT_ROOT / "Gnt1.1TrainPart2",
 )
 TEST_ROOT = PROJECT_ROOT / "Gnt1.1Test"
+HWDB10_TRAIN_ROOTS = (
+    PROJECT_ROOT / "Gnt1.0TrainPart1",
+    PROJECT_ROOT / "Gnt1.0TrainPart2",
+    PROJECT_ROOT / "Gnt1.0TrainPart3",
+)
+HWDB10_TEST_ROOT = PROJECT_ROOT / "Gnt1.0Test"
 CACHE_ROOT = PROJECT_ROOT / "cache"
 OUTPUT_ROOT = PROJECT_ROOT / "outputs"
 VALIDATION_MANIFEST = CACHE_ROOT / "validation_split.json"
+DATA_PROFILES = ("hwdb11", "hwdb10_11_shared")
+TEST_PROFILES = ("hwdb11", "hwdb10_shared")
+SAMPLING_STRATEGIES = ("natural", "class-balanced")
 
 
 def validate_dataset_paths(
@@ -41,14 +50,43 @@ def validate_dataset_paths(
             raise ValueError(f"dataset directory contains no .gnt files: {path}")
 
 
+def validate_config_paths(config: TrainConfig) -> None:
+    """校验当前数据配置涉及的目录，并确保训练源与测试源互斥。"""
+
+    validate_dataset_paths(config.train_roots, config.test_root)
+    extra_paths: tuple[Path, ...] = ()
+    if config.data_profile == "hwdb10_11_shared":
+        if len(config.additional_train_roots) != 3:
+            raise ValueError("hwdb10_11_shared requires three HWDB1.0 training directories")
+        extra_paths = config.additional_train_roots
+    if config.test_profile == "hwdb10_shared":
+        extra_paths += (config.hwdb10_test_root,)
+    for path in extra_paths:
+        if not path.is_dir():
+            raise FileNotFoundError(f"dataset directory does not exist: {path}")
+        if not any(path.glob("*.gnt")):
+            raise ValueError(f"dataset directory contains no .gnt files: {path}")
+    train_paths = {path.resolve() for path in config.train_roots}
+    if config.data_profile == "hwdb10_11_shared":
+        train_paths.update(path.resolve() for path in config.additional_train_roots)
+    test_paths = {config.test_root.resolve(), config.hwdb10_test_root.resolve()}
+    if train_paths.intersection(test_paths):
+        raise ValueError("training and test directories must be disjoint")
+
+
 @dataclass(slots=True)
 class TrainConfig:
     """训练、验证和 checkpoint 所需的全部参数。"""
 
     train_roots: tuple[Path, ...] = TRAIN_ROOTS
     test_root: Path = TEST_ROOT
+    additional_train_roots: tuple[Path, ...] = HWDB10_TRAIN_ROOTS
+    hwdb10_test_root: Path = HWDB10_TEST_ROOT
     cache_dir: Path = CACHE_ROOT
     output_dir: Path = OUTPUT_ROOT
+    data_profile: str = "hwdb11"
+    test_profile: str = "hwdb11"
+    sampling_strategy: str = "natural"
     model_name: str = "hccr_cnn9"
     recipe: str = "modern"
     image_size: int = 96
@@ -97,11 +135,24 @@ class TrainConfig:
             raise ValueError("preprocess_profile must be 'legacy' or 'margin_v1'")
         if self.augmentation_profile not in {"legacy", "gentle_elastic"}:
             raise ValueError("augmentation_profile must be 'legacy' or 'gentle_elastic'")
+        if self.data_profile not in DATA_PROFILES:
+            raise ValueError(f"data_profile must be one of {DATA_PROFILES}")
+        if self.test_profile not in TEST_PROFILES:
+            raise ValueError(f"test_profile must be one of {TEST_PROFILES}")
+        if self.sampling_strategy not in SAMPLING_STRATEGIES:
+            raise ValueError(f"sampling_strategy must be one of {SAMPLING_STRATEGIES}")
 
     def as_dict(self) -> dict[str, Any]:
         values = asdict(self)
-        values["train_roots"] = [str(path) for path in self.train_roots]
-        for key in ("test_root", "cache_dir", "output_dir", "validation_manifest"):
+        for key in ("train_roots", "additional_train_roots"):
+            values[key] = [str(path) for path in values[key]]
+        for key in (
+            "test_root",
+            "hwdb10_test_root",
+            "cache_dir",
+            "output_dir",
+            "validation_manifest",
+        ):
             values[key] = str(values[key])
         for key in ("resume", "finetune_from", "warm_start_from"):
             if values[key] is not None:

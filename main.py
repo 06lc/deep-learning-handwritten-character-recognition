@@ -21,14 +21,20 @@ from compression import (
 )
 from config import (
     CACHE_ROOT,
+    DATA_PROFILES,
+    HWDB10_TEST_ROOT,
+    HWDB10_TRAIN_ROOTS,
     OUTPUT_ROOT,
+    SAMPLING_STRATEGIES,
+    TEST_PROFILES,
     TEST_ROOT,
     TRAIN_ROOTS,
     VALIDATION_MANIFEST,
     TrainConfig,
-    validate_dataset_paths,
+    validate_config_paths,
 )
 from error_analysis import analyze_checkpoint
+from gnt_dataset import split_record_indices_by_file
 from predict import image_paths, predict_image
 from train import (
     evaluate_checkpoint,
@@ -36,6 +42,7 @@ from train import (
     load_checkpoint,
     make_train_validation_loaders,
     prepare_indexes,
+    prepare_indexes_with_report,
     resolve_device,
     run_epoch,
 )
@@ -49,6 +56,10 @@ def _add_dataset_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _add_train_arguments(parser: argparse.ArgumentParser) -> None:
     _add_dataset_arguments(parser)
+    parser.add_argument("--data-profile", choices=DATA_PROFILES, default="hwdb11")
+    parser.add_argument(
+        "--sampling-strategy", choices=SAMPLING_STRATEGIES, default="natural"
+    )
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_ROOT)
     parser.add_argument("--model", dest="model_name", default="hccr_cnn9")
     parser.add_argument("--recipe", choices=("modern", "paper"), default="modern")
@@ -106,6 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     index_parser = subparsers.add_parser("index", help="build and validate GNT indexes")
     _add_dataset_arguments(index_parser)
+    index_parser.add_argument("--data-profile", choices=DATA_PROFILES, default="hwdb11")
     index_parser.add_argument("--expected-num-classes", type=int, default=3926)
     index_parser.add_argument("--rebuild-index", action="store_true")
 
@@ -115,6 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_parser = subparsers.add_parser("evaluate", help="evaluate a checkpoint on Test")
     evaluate_parser.add_argument("--checkpoint", type=Path, required=True)
     _add_dataset_arguments(evaluate_parser)
+    evaluate_parser.add_argument("--test-profile", choices=TEST_PROFILES, default="hwdb11")
     evaluate_parser.add_argument("--batch-size", type=int, default=128)
     evaluate_parser.add_argument("--num-workers", type=int, default=0)
     evaluate_parser.add_argument("--device", default="auto")
@@ -127,6 +140,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     analyze_parser.add_argument("--checkpoint", type=Path, required=True)
     _add_dataset_arguments(analyze_parser)
+    analyze_parser.add_argument("--data-profile", choices=DATA_PROFILES, default="hwdb11")
+    analyze_parser.add_argument("--test-profile", choices=TEST_PROFILES, default="hwdb11")
     analyze_parser.add_argument("--split", choices=("validation", "test"), default="validation")
     analyze_parser.add_argument("--validation-manifest", type=Path, default=VALIDATION_MANIFEST)
     analyze_parser.add_argument("--val-fraction", type=float, default=0.1)
@@ -191,24 +206,35 @@ def _run_index(args: argparse.Namespace) -> int:
     config = TrainConfig(
         train_roots=train_roots,
         test_root=test_root,
+        additional_train_roots=HWDB10_TRAIN_ROOTS,
+        hwdb10_test_root=HWDB10_TEST_ROOT,
         cache_dir=cache_dir,
+        data_profile=args.data_profile,
         expected_num_classes=args.expected_num_classes,
         rebuild_index=args.rebuild_index,
     )
-    validate_dataset_paths(train_roots, test_root)
-    train_index, test_index = prepare_indexes(config)
+    validate_config_paths(config)
+    train_index, test_index, report = prepare_indexes_with_report(config)
+    _, validation_indices = split_record_indices_by_file(
+        train_index,
+        config.val_fraction,
+        config.split_seed,
+        manifest_path=config.validation_manifest,
+        roots=config.train_roots,
+    )
+    summary = {
+        **report,
+        "train_files": len(train_index.files),
+        "train_samples": len(train_index.records),
+        "test_files": len(test_index.files),
+        "validation_samples": len(validation_indices),
+        "train_roots": [str(p.resolve()) for p in train_roots],
+        "test_root": str(test_root.resolve()),
+        "cache_dir": str(cache_dir.resolve()),
+    }
     print(
         json.dumps(
-            {
-                "train_files": len(train_index.files),
-                "train_samples": len(train_index.records),
-                "test_files": len(test_index.files),
-                "test_samples": len(test_index.records),
-                "num_classes": len(train_index.class_names),
-                "train_roots": [str(p.resolve()) for p in train_roots],
-                "test_root": str(test_root.resolve()),
-                "cache_dir": str(cache_dir.resolve()),
-            },
+            summary,
             ensure_ascii=False,
             indent=2,
         )
@@ -221,8 +247,12 @@ def _run_train(args: argparse.Namespace) -> int:
     config = TrainConfig(
         train_roots=train_roots,
         test_root=test_root,
+        additional_train_roots=HWDB10_TRAIN_ROOTS,
+        hwdb10_test_root=HWDB10_TEST_ROOT,
         cache_dir=cache_dir,
         output_dir=args.output_dir,
+        data_profile=args.data_profile,
+        sampling_strategy=args.sampling_strategy,
         model_name=args.model_name,
         recipe=args.recipe,
         image_size=args.image_size,
@@ -252,7 +282,7 @@ def _run_train(args: argparse.Namespace) -> int:
         max_train_batches=args.max_train_batches,
         max_eval_batches=args.max_eval_batches,
     )
-    validate_dataset_paths(train_roots, test_root)
+    validate_config_paths(config)
     print(json.dumps(fit(config), ensure_ascii=False, indent=2))
     return 0
 
@@ -262,7 +292,9 @@ def _run_evaluate(args: argparse.Namespace) -> int:
     config = TrainConfig(
         train_roots=train_roots,
         test_root=test_root,
+        hwdb10_test_root=HWDB10_TEST_ROOT,
         cache_dir=cache_dir,
+        test_profile=args.test_profile,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         device=args.device,
@@ -270,7 +302,7 @@ def _run_evaluate(args: argparse.Namespace) -> int:
         rebuild_index=args.rebuild_index,
         max_eval_batches=args.max_eval_batches,
     )
-    validate_dataset_paths(train_roots, test_root)
+    validate_config_paths(config)
     print(
         json.dumps(
             evaluate_checkpoint(args.checkpoint, config, args.output_dir),
@@ -312,7 +344,11 @@ def _run_analyze(args: argparse.Namespace) -> int:
     config = TrainConfig(
         train_roots=train_roots,
         test_root=test_root,
+        additional_train_roots=HWDB10_TRAIN_ROOTS,
+        hwdb10_test_root=HWDB10_TEST_ROOT,
         cache_dir=cache_dir,
+        data_profile=args.data_profile,
+        test_profile=args.test_profile,
         validation_manifest=args.validation_manifest,
         val_fraction=args.val_fraction,
         split_seed=args.split_seed,
@@ -322,7 +358,7 @@ def _run_analyze(args: argparse.Namespace) -> int:
         expected_num_classes=None,
         max_eval_batches=args.max_eval_batches,
     )
-    validate_dataset_paths(train_roots, test_root)
+    validate_config_paths(config)
     result = analyze_checkpoint(
         args.checkpoint,
         config,
@@ -383,7 +419,7 @@ def _run_compress(args: argparse.Namespace) -> int:
             device=str(device),
             expected_num_classes=len(payload["class_names"]),
         )
-        validate_dataset_paths(TRAIN_ROOTS, TEST_ROOT)
+        validate_config_paths(config)
         train_index, _ = prepare_indexes(config)
         train_loader, validation_loader = make_train_validation_loaders(train_index, config, device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-5)

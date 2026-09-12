@@ -50,6 +50,19 @@ def _make_fixture(root: Path) -> tuple[tuple[Path, Path], Path, Path]:
     return (train_part1, train_part2), test_root, input_image
 
 
+def _make_hwdb10_fixture(root: Path) -> tuple[tuple[Path, Path, Path], Path]:
+    train_roots = tuple(root / f"additional-{part}" for part in range(3))
+    test_root = root / "additional-test"
+    for directory in (*train_roots, test_root):
+        directory.mkdir()
+    image_b = np.array([[0, 255], [0, 255]], dtype=np.uint8)
+    image_c = np.full((2, 2), 128, dtype=np.uint8)
+    for writer, directory in enumerate(train_roots):
+        _write_gnt(directory / f"{writer}-f.gnt", [("B", image_b), ("C", image_c)])
+    _write_gnt(test_root / "006-t.gnt", [("B", image_b), ("C", image_c)])
+    return train_roots, test_root
+
+
 def test_fit_evaluate_and_predict_round_trip(tmp_path: Path) -> None:
     train_roots, test_root, test_file = _make_fixture(tmp_path)
     config = TrainConfig(
@@ -241,3 +254,97 @@ def test_residual_attention_gslre_checkpoint_round_trip(tmp_path: Path) -> None:
     assert replaced == 7
     assert metadata["model_name"] == "hccr_cnn9_ra_gslre"
     assert restored(torch.randn(1, 1, 16, 16)).shape == (1, 2)
+
+
+def test_hwdb10_shared_training_preserves_mapping_and_metadata(tmp_path: Path) -> None:
+    train_roots, test_root, _ = _make_fixture(tmp_path)
+    additional_roots, additional_test = _make_hwdb10_fixture(tmp_path)
+    source_config = TrainConfig(
+        train_roots=train_roots,
+        test_root=test_root,
+        cache_dir=tmp_path / "cache",
+        output_dir=tmp_path / "source",
+        image_size=16,
+        batch_size=2,
+        epochs=1,
+        warmup_epochs=0,
+        val_fraction=0.5,
+        num_workers=0,
+        device="cpu",
+        expected_num_classes=2,
+        max_train_batches=1,
+        max_eval_batches=1,
+    )
+    fit(source_config)
+    source_checkpoint = source_config.output_dir / "best.pt"
+    baseline_cache = (source_config.cache_dir / "train.npz").read_bytes()
+    expanded_config = replace(
+        source_config,
+        additional_train_roots=additional_roots,
+        hwdb10_test_root=additional_test,
+        output_dir=tmp_path / "expanded",
+        data_profile="hwdb10_11_shared",
+        sampling_strategy="class-balanced",
+        finetune_from=source_checkpoint,
+    )
+
+    result = fit(expanded_config)
+    payload = torch.load(
+        expanded_config.output_dir / "last.pt", map_location="cpu", weights_only=False
+    )
+
+    assert result["class_names"] == ["A", "B"]
+    assert result["train_samples"] == 5
+    assert result["validation_samples"] == 2
+    assert result["additional_scanned_samples"] == 6
+    assert result["additional_accepted_samples"] == 3
+    assert result["additional_excluded_samples"] == 3
+    assert result["excluded_class_names"] == ["C"]
+    assert result["primary_only_class_names"] == ["A"]
+    assert payload["data_profile"] == "hwdb10_11_shared"
+    assert payload["canonical_class_mapping_source"] == "HWDB1.1 training index"
+    assert payload["finetune_source"]["checkpoint"] == str(source_checkpoint.resolve())
+    assert (expanded_config.cache_dir / "train.npz").is_file()
+    assert (expanded_config.cache_dir / "train_hwdb10_11_shared.npz").is_file()
+    assert (expanded_config.cache_dir / "train.npz").read_bytes() == baseline_cache
+
+    test_config = replace(expanded_config, test_profile="hwdb10_shared")
+    metrics = evaluate_checkpoint(
+        expanded_config.output_dir / "best.pt", test_config, tmp_path / "hwdb10-evaluation"
+    )
+    assert metrics["test_profile"] == "hwdb10_shared"
+    assert metrics["test_scanned_samples"] == 2
+    assert metrics["test_accepted_samples"] == 1
+    assert metrics["test_excluded_samples"] == 1
+
+
+def test_expanded_training_rejects_baseline_resume(tmp_path: Path) -> None:
+    train_roots, test_root, _ = _make_fixture(tmp_path)
+    additional_roots, additional_test = _make_hwdb10_fixture(tmp_path)
+    source_config = TrainConfig(
+        train_roots=train_roots,
+        test_root=test_root,
+        cache_dir=tmp_path / "cache",
+        output_dir=tmp_path / "source",
+        image_size=16,
+        batch_size=2,
+        epochs=1,
+        warmup_epochs=0,
+        val_fraction=0.5,
+        num_workers=0,
+        device="cpu",
+        expected_num_classes=2,
+        max_train_batches=1,
+        max_eval_batches=1,
+    )
+    fit(source_config)
+    expanded_config = replace(
+        source_config,
+        additional_train_roots=additional_roots,
+        hwdb10_test_root=additional_test,
+        data_profile="hwdb10_11_shared",
+        resume=source_config.output_dir / "last.pt",
+    )
+
+    with pytest.raises(ValueError, match="use --finetune-from"):
+        fit(expanded_config)

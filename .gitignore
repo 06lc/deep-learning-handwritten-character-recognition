@@ -8,5 +8,9 @@ outputs/
 Gnt1.1Test/
 Gnt1.1TrainPart1/
 Gnt1.1TrainPart2/
+Gnt1.0Test/
+Gnt1.0TrainPart1/
+Gnt1.0TrainPart2/
+Gnt1.0TrainPart3/
 *.pyc
 *.egg-info/
