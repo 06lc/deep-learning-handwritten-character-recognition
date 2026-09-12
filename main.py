@@ -24,9 +24,11 @@ from config import (
     OUTPUT_ROOT,
     TEST_ROOT,
     TRAIN_ROOTS,
+    VALIDATION_MANIFEST,
     TrainConfig,
     validate_dataset_paths,
 )
+from error_analysis import analyze_checkpoint
 from predict import image_paths, predict_image
 from train import (
     evaluate_checkpoint,
@@ -52,10 +54,15 @@ def _add_train_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--recipe", choices=("modern", "paper"), default="modern")
     parser.add_argument("--image-size", type=int, default=96)
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--val-fraction", type=float, default=0.1)
+    parser.add_argument("--split-seed", type=int, default=42)
+    parser.add_argument("--validation-manifest", type=Path, default=VALIDATION_MANIFEST)
     # 初始学习率；需要微调时使用更小值并从 checkpoint 重新建立优化器。
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--warmup-epochs", type=int, default=5)
+    parser.add_argument("--min-learning-rate", type=float, default=1e-6)
+    parser.add_argument("--ema-decay", type=float, default=0.9999)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--patience", type=int, default=5)
@@ -65,6 +72,14 @@ def _add_train_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--expected-num-classes", type=int, default=3926)
     parser.add_argument("--rebuild-index", action="store_true")
+    parser.add_argument(
+        "--preprocess-profile", choices=("legacy", "margin_v1"), default="legacy"
+    )
+    parser.add_argument(
+        "--augmentation-profile",
+        choices=("legacy", "gentle_elastic"),
+        default="legacy",
+    )
     checkpoint_group = parser.add_mutually_exclusive_group()
     checkpoint_group.add_argument(
         "--resume",
@@ -75,6 +90,11 @@ def _add_train_arguments(parser: argparse.ArgumentParser) -> None:
         "--finetune-from",
         type=Path,
         help="load only model weights and class mapping for a new fine-tuning run",
+    )
+    checkpoint_group.add_argument(
+        "--warm-start-from",
+        type=Path,
+        help="transfer compatible baseline weights into hccr_cnn9_ra",
     )
     parser.add_argument("--max-train-batches", type=int)
     parser.add_argument("--max-eval-batches", type=int)
@@ -101,6 +121,22 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_parser.add_argument("--output-dir", type=Path)
     evaluate_parser.add_argument("--rebuild-index", action="store_true")
     evaluate_parser.add_argument("--max-eval-batches", type=int)
+
+    analyze_parser = subparsers.add_parser(
+        "analyze", help="analyze validation or Test errors for a checkpoint"
+    )
+    analyze_parser.add_argument("--checkpoint", type=Path, required=True)
+    _add_dataset_arguments(analyze_parser)
+    analyze_parser.add_argument("--split", choices=("validation", "test"), default="validation")
+    analyze_parser.add_argument("--validation-manifest", type=Path, default=VALIDATION_MANIFEST)
+    analyze_parser.add_argument("--val-fraction", type=float, default=0.1)
+    analyze_parser.add_argument("--split-seed", type=int, default=42)
+    analyze_parser.add_argument("--batch-size", type=int, default=128)
+    analyze_parser.add_argument("--num-workers", type=int, default=0)
+    analyze_parser.add_argument("--device", default="auto")
+    analyze_parser.add_argument("--output-dir", type=Path)
+    analyze_parser.add_argument("--max-errors", type=int, default=100)
+    analyze_parser.add_argument("--max-eval-batches", type=int)
 
     predict_parser = subparsers.add_parser("predict", help="predict one image or directory")
     predict_parser.add_argument("--checkpoint", type=Path, required=True)
@@ -193,7 +229,12 @@ def _run_train(args: argparse.Namespace) -> int:
         batch_size=args.batch_size,
         epochs=args.epochs,
         val_fraction=args.val_fraction,
+        split_seed=args.split_seed,
+        validation_manifest=args.validation_manifest,
         learning_rate=args.learning_rate,
+        warmup_epochs=args.warmup_epochs,
+        min_learning_rate=args.min_learning_rate,
+        ema_decay=args.ema_decay,
         weight_decay=args.weight_decay,
         label_smoothing=args.label_smoothing,
         patience=args.patience,
@@ -203,8 +244,11 @@ def _run_train(args: argparse.Namespace) -> int:
         amp=not args.no_amp,
         expected_num_classes=args.expected_num_classes,
         rebuild_index=args.rebuild_index,
+        preprocess_profile=args.preprocess_profile,
+        augmentation_profile=args.augmentation_profile,
         resume=args.resume,
         finetune_from=args.finetune_from,
+        warm_start_from=args.warm_start_from,
         max_train_batches=args.max_train_batches,
         max_eval_batches=args.max_eval_batches,
     )
@@ -241,12 +285,52 @@ def _run_predict(args: argparse.Namespace) -> int:
     device = resolve_device(args.device)
     model, metadata = load_checkpoint(args.checkpoint, device)
     image_size = int(metadata.get("image_size", metadata.get("config", {}).get("image_size", 96)))
+    preprocess_profile = str(
+        metadata.get("preprocessing", {}).get(
+            "profile", metadata.get("config", {}).get("preprocess_profile", "legacy")
+        )
+    )
     paths = [args.input] if args.input else image_paths(args.input_dir)
     results = [
-        predict_image(model, path, metadata["class_names"], image_size, device, args.top_k)
+        predict_image(
+            model,
+            path,
+            metadata["class_names"],
+            image_size,
+            device,
+            args.top_k,
+            preprocess_profile,
+        )
         for path in paths
     ]
     print(json.dumps(results, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _run_analyze(args: argparse.Namespace) -> int:
+    train_roots, test_root, cache_dir = _dataset_roots(args)
+    config = TrainConfig(
+        train_roots=train_roots,
+        test_root=test_root,
+        cache_dir=cache_dir,
+        validation_manifest=args.validation_manifest,
+        val_fraction=args.val_fraction,
+        split_seed=args.split_seed,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        device=args.device,
+        expected_num_classes=None,
+        max_eval_batches=args.max_eval_batches,
+    )
+    validate_dataset_paths(train_roots, test_root)
+    result = analyze_checkpoint(
+        args.checkpoint,
+        config,
+        split=args.split,
+        output_dir=args.output_dir,
+        max_errors=args.max_errors,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -256,10 +340,25 @@ def _run_compress(args: argparse.Namespace) -> int:
     output_dir = args.output_dir or args.checkpoint.parent / "compressed"
     output_dir.mkdir(parents=True, exist_ok=True)
     report: dict[str, object] = {"source": str(args.checkpoint), "stages": []}
+    artifact_payload = {
+        key: value
+        for key, value in payload.items()
+        if key
+        not in {
+            "model_state",
+            "training_model_state",
+            "ema_model_state",
+            "optimizer_state",
+            "scheduler_state",
+            "scaler_state",
+        }
+    }
 
     def finetune() -> dict[str, float] | None:
         if args.finetune_epochs <= 0:
             return None
+        checkpoint_config = payload.get("config", {})
+        preprocessing = payload.get("preprocessing", {})
         config = TrainConfig(
             train_roots=TRAIN_ROOTS,
             test_root=TEST_ROOT,
@@ -267,6 +366,17 @@ def _run_compress(args: argparse.Namespace) -> int:
             output_dir=output_dir,
             model_name=str(payload.get("model_name", "hccr_cnn9")),
             image_size=int(payload.get("image_size", 96)),
+            preprocess_profile=str(
+                preprocessing.get(
+                    "profile", checkpoint_config.get("preprocess_profile", "legacy")
+                )
+            ),
+            augmentation_profile=str(
+                preprocessing.get(
+                    "augmentation_profile",
+                    checkpoint_config.get("augmentation_profile", "legacy"),
+                )
+            ),
             epochs=args.finetune_epochs,
             batch_size=128,
             num_workers=8,
@@ -305,11 +415,12 @@ def _run_compress(args: argparse.Namespace) -> int:
                 stage_payload["validation"] = fine_tune_metrics
             torch.save(
                 {
-                    **payload,
+                    **artifact_payload,
                     "model_name": f"{payload.get('model_name', 'hccr_cnn9')}_gslre",
                     "gslre_rank_ratio": args.rank_ratio,
                     "model_state": model.state_dict(),
                     "compression_stage": stage,
+                    "primary_weight_source": "compressed",
                 },
                 output_dir / "gslre.pt",
             )
@@ -323,7 +434,7 @@ def _run_compress(args: argparse.Namespace) -> int:
                 stage_payload["validation"] = fine_tune_metrics
             torch.save(
                 {
-                    **payload,
+                    **artifact_payload,
                     "model_name": (
                         f"{payload.get('model_name', 'hccr_cnn9')}_gslre"
                         if any(
@@ -334,6 +445,7 @@ def _run_compress(args: argparse.Namespace) -> int:
                     "gslre_rank_ratio": args.rank_ratio,
                     "model_state": model.state_dict(),
                     "compression_stage": stage,
+                    "primary_weight_source": "compressed",
                 },
                 output_dir / "adw.pt",
             )
@@ -351,6 +463,10 @@ def _run_compress(args: argparse.Namespace) -> int:
                 "class_names": payload["class_names"],
                 "class_to_idx": payload["class_to_idx"],
                 "image_size": payload.get("image_size", 96),
+                "preprocessing": payload.get(
+                    "preprocessing",
+                    {"profile": "legacy", "augmentation_profile": "legacy"},
+                ),
                 "config": payload.get("config", {}),
                 "metrics": payload.get("metrics", {}),
                 "epoch": payload.get("epoch", 0),
@@ -413,7 +529,8 @@ def _run_export(args: argparse.Namespace) -> int:
     output_dir = args.output_dir or args.checkpoint.parent / "exported"
     output_dir.mkdir(parents=True, exist_ok=True)
     size = int(metadata.get("image_size", 96))
-    example = torch.randn(1, 1, size, size, device=device)
+    model_dtype = next(model.parameters()).dtype
+    example = torch.randn(1, 1, size, size, device=device, dtype=model_dtype)
     traced = torch.jit.trace(model, example)
     traced.save(str(output_dir / "model.ts"))
     fp16_path = output_dir / "fp16.pt"
@@ -425,6 +542,10 @@ def _run_export(args: argparse.Namespace) -> int:
             "class_names": metadata["class_names"],
             "class_to_idx": metadata["class_to_idx"],
             "image_size": size,
+            "preprocessing": metadata.get(
+                "preprocessing",
+                {"profile": "legacy", "augmentation_profile": "legacy"},
+            ),
             "precision": "fp16",
             "model_state": fp16_state,
         },
@@ -456,6 +577,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_train(args)
         if args.command == "evaluate":
             return _run_evaluate(args)
+        if args.command == "analyze":
+            return _run_analyze(args)
         if args.command == "predict":
             return _run_predict(args)
         if args.command == "compress":

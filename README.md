@@ -43,11 +43,33 @@ python main.py index
 
 ## 训练
 
-默认使用 HCCR-CNN9Layer、`96x96`、3926 类、AdamW、Cosine 学习率、AMP 和断点恢复：
+默认使用 HCCR-CNN9Layer、`96x96`、3926 类、AdamW、5 轮学习率热身、
+Cosine 学习率、EMA 权重平均、AMP 和断点恢复：
 
 ```bash
-python main.py train --device cuda --batch-size 128 --num-workers 8 --epochs 30
+python main.py train --device cuda --batch-size 128 --num-workers 8 --epochs 60
 ```
+
+首次训练会创建 `cache/validation_split.json`。它使用训练目录编号和相对路径记录固定验证文件，
+后续实验即使更换训练随机种子也使用同一验证集。
+
+安全边距和温和弹性增强：
+
+```bash
+python main.py train --device cuda --epochs 60 --patience 60 \
+  --preprocess-profile margin_v1 --augmentation-profile gentle_elastic
+```
+
+从原始九层模型向残差注意力九层模型迁移权重：
+
+```bash
+python main.py train --device cuda --model hccr_cnn9_ra \
+  --warm-start-from outputs/full/best.pt --learning-rate 1e-4 \
+  --warmup-epochs 2 --epochs 30 --patience 30
+```
+
+`--resume`、`--finetune-from`、`--warm-start-from` 三者互斥：前者完整恢复训练状态，
+第二个只加载同结构推理权重，第三个将原始九层权重迁移到增强九层模型。
 
 论文风格 SGD 对照实验：
 
@@ -63,6 +85,16 @@ python main.py train --device cuda --model hccr_cnn9 --image-size 96 --recipe pa
 python main.py evaluate --checkpoint outputs/best.pt --device cuda
 python main.py predict --checkpoint outputs/best.pt --input sample-pics/5.jpg --top-k 5
 ```
+
+错误分析默认使用固定验证集，不会访问 Test：
+
+```bash
+python main.py analyze --checkpoint outputs/best.pt --device cuda \
+  --output-dir outputs/best-analysis --max-errors 100
+```
+
+报告包含类别准确率、主要混淆对、高置信错误和对应原始字符图片。只有最终候选模型才使用
+`--split test`。完整实验顺序见 `EXPERIMENTS.md`。
 
 ## 压缩
 

@@ -25,7 +25,7 @@ deploy = [
 ]
 
 [tool.setuptools]
-py-modules = ["config", "compression", "gnt_dataset", "model", "predict", "train", "main"]
+py-modules = ["config", "compression", "error_analysis", "gnt_dataset", "model", "predict", "train", "main"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

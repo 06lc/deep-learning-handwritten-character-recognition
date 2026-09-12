@@ -12,6 +12,7 @@ from gnt_dataset import (
     GNTDataset,
     build_index,
     load_index,
+    preprocess_image,
     save_index,
     split_record_indices_by_file,
 )
@@ -103,3 +104,76 @@ def test_validation_split_keeps_files_disjoint(tmp_path: Path) -> None:
     validation_files = {index.records[i].file_id for i in validation_indices}
     assert train_files.isdisjoint(validation_files)
     assert train_indices and validation_indices
+
+
+def test_validation_manifest_is_portable_and_stable(tmp_path: Path) -> None:
+    roots = (tmp_path / "first", tmp_path / "second")
+    for root_index, root in enumerate(roots):
+        root.mkdir()
+        for writer in range(2):
+            _write_gnt(
+                root / f"{root_index}-{writer}.gnt",
+                [("A", np.zeros((2, 2), dtype=np.uint8))],
+            )
+    manifest = tmp_path / "validation.json"
+    index = build_index(roots)
+    _, first_validation = split_record_indices_by_file(
+        index,
+        validation_fraction=0.5,
+        seed=42,
+        manifest_path=manifest,
+        roots=roots,
+    )
+    selected_names = {index.files[index.records[i].file_id].name for i in first_validation}
+
+    relocated = (tmp_path / "moved-first", tmp_path / "moved-second")
+    for root_index, root in enumerate(relocated):
+        root.mkdir()
+        for writer in range(2):
+            _write_gnt(
+                root / f"{root_index}-{writer}.gnt",
+                [("A", np.zeros((2, 2), dtype=np.uint8))],
+            )
+    for writer in range(2):
+        _write_gnt(
+            relocated[0] / f"extra-{writer}.gnt",
+            [("A", np.zeros((2, 2), dtype=np.uint8))],
+        )
+    relocated_index = build_index(relocated)
+    _, second_validation = split_record_indices_by_file(
+        relocated_index,
+        validation_fraction=0.5,
+        seed=42,
+        manifest_path=manifest,
+        roots=relocated,
+    )
+    relocated_names = {
+        relocated_index.files[relocated_index.records[i].file_id].name
+        for i in second_validation
+    }
+
+    assert selected_names == relocated_names
+
+
+def test_margin_preprocessing_leaves_safe_border() -> None:
+    tensor = preprocess_image(
+        np.zeros((12, 12), dtype=np.uint8), 96, preprocess_profile="margin_v1"
+    )
+    rows, columns = torch.where(tensor[0] < 0.0)
+
+    assert int(rows.min()) >= 4
+    assert int(columns.min()) >= 4
+    assert int(rows.max()) <= 91
+    assert int(columns.max()) <= 91
+
+
+def test_gentle_elastic_augmentation_preserves_shape() -> None:
+    tensor = preprocess_image(
+        np.zeros((12, 8), dtype=np.uint8),
+        96,
+        augment=True,
+        preprocess_profile="margin_v1",
+        augmentation_profile="gentle_elastic",
+    )
+
+    assert tensor.shape == (1, 96, 96)

@@ -20,6 +20,7 @@ def predict_image(
     image_size: int,
     device: str | torch.device,
     top_k: int = 5,
+    preprocess_profile: str = "legacy",
 ) -> dict[str, object]:
     """返回单张图片的预测字符、置信度和 Top-K 候选。"""
 
@@ -29,7 +30,9 @@ def predict_image(
     if top_k < 1:
         raise ValueError("top_k must be at least 1")
     with Image.open(path) as image:
-        tensor = preprocess_image(image, image_size).unsqueeze(0).to(device)
+        tensor = preprocess_image(
+            image, image_size, preprocess_profile=preprocess_profile
+        ).unsqueeze(0).to(device)
     try:
         tensor = tensor.to(dtype=next(model.parameters()).dtype)
     except StopIteration:

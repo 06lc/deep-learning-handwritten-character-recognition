@@ -4,9 +4,17 @@ import struct
 from pathlib import Path
 
 import numpy as np
+import pytest
+import torch
 
 from config import TrainConfig
-from train import prepare_indexes
+from model import create_model
+from train import (
+    ExponentialMovingAverage,
+    _optimizer_and_scheduler,
+    load_checkpoint,
+    prepare_indexes,
+)
 
 
 def _write_one_record(path: Path, label: str) -> None:
@@ -47,3 +55,55 @@ def test_prepare_indexes_rebuilds_when_configured_roots_change(tmp_path: Path) -
     train_index, _ = prepare_indexes(second_config)
 
     assert train_index.files == (second_train.resolve() / "1002-f.gnt",)
+
+
+def test_exponential_moving_average_updates_weights() -> None:
+    model = torch.nn.Linear(1, 1, bias=False)
+    model.weight.data.fill_(1.0)
+    ema = ExponentialMovingAverage(model, decay=0.5)
+    model.weight.data.fill_(3.0)
+
+    ema.update(model)
+
+    assert float(ema.model.weight) == pytest.approx(2.0)
+
+
+def test_warmup_cosine_scheduler_reaches_base_and_minimum_learning_rates() -> None:
+    model = torch.nn.Linear(2, 2)
+    config = TrainConfig(
+        epochs=10,
+        learning_rate=3e-4,
+        warmup_epochs=2,
+        min_learning_rate=1e-6,
+    )
+    optimizer, scheduler = _optimizer_and_scheduler(model, config)
+
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(3e-5)
+    for _ in range(2):
+        optimizer.step()
+        scheduler.step()
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(3e-4)
+    for _ in range(8):
+        optimizer.step()
+        scheduler.step()
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(1e-6)
+
+
+def test_old_checkpoint_without_preprocessing_remains_loadable(tmp_path: Path) -> None:
+    # 使用旧轻量模型的真实结构，模拟缺少 preprocessing/EMA 字段的历史产物。
+    model = create_model("cnn", 2)
+    checkpoint = tmp_path / "old.pt"
+    torch.save(
+        {
+            "model_name": "cnn",
+            "class_names": ["A", "B"],
+            "image_size": 16,
+            "model_state": model.state_dict(),
+        },
+        checkpoint,
+    )
+
+    restored, payload = load_checkpoint(checkpoint)
+
+    assert "preprocessing" not in payload
+    assert restored(torch.randn(1, 1, 16, 16)).shape == (1, 2)

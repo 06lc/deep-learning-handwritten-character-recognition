@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import random
 import struct
 from collections.abc import Sequence
@@ -179,7 +180,12 @@ def load_index(path: str | Path) -> GNTIndex:
 
 
 def split_record_indices_by_file(
-    index: GNTIndex, validation_fraction: float = 0.1, seed: int = 42
+    index: GNTIndex,
+    validation_fraction: float = 0.1,
+    seed: int = 42,
+    *,
+    manifest_path: str | Path | None = None,
+    roots: Sequence[str | Path] | None = None,
 ) -> tuple[list[int], list[int]]:
     """按 GNT 文件切分训练/验证样本，避免书写者风格泄漏。"""
 
@@ -188,11 +194,19 @@ def split_record_indices_by_file(
     file_ids = list(range(len(index.files)))
     if len(file_ids) < 2:
         raise DatasetFormatError("at least two GNT files are required for validation")
+    validation_count = min(
+        max(1, round(len(file_ids) * validation_fraction)), len(file_ids) - 1
+    )
     rng = random.Random(seed)
-    rng.shuffle(file_ids)
-    validation_count = max(1, round(len(file_ids) * validation_fraction))
-    validation_count = min(validation_count, len(file_ids) - 1)
-    validation_files = set(file_ids[:validation_count])
+    if manifest_path is None:
+        rng.shuffle(file_ids)
+        validation_files = set(file_ids[:validation_count])
+    else:
+        if roots is None:
+            raise ValueError("roots are required when using a validation manifest")
+        validation_files = _load_or_create_validation_files(
+            index, roots, Path(manifest_path), validation_count, validation_fraction, seed
+        )
     train_indices = [
         i for i, record in enumerate(index.records) if record.file_id not in validation_files
     ]
@@ -204,11 +218,81 @@ def split_record_indices_by_file(
     return train_indices, validation_indices
 
 
-def _letterbox(image: np.ndarray, image_size: int) -> Image.Image:
+def _portable_file_entry(path: Path, roots: Sequence[Path]) -> dict[str, object]:
+    for root_index, root in enumerate(roots):
+        try:
+            relative = path.resolve().relative_to(root)
+        except ValueError:
+            continue
+        return {"root": root_index, "path": relative.as_posix()}
+    raise DatasetFormatError(f"indexed file is outside configured training roots: {path}")
+
+
+def _load_or_create_validation_files(
+    index: GNTIndex,
+    roots: Sequence[str | Path],
+    manifest_path: Path,
+    validation_count: int,
+    validation_fraction: float,
+    seed: int,
+) -> set[int]:
+    resolved_roots = tuple(Path(root).resolve() for root in roots)
+    file_lookup = {path.resolve(): file_id for file_id, path in enumerate(index.files)}
+    if manifest_path.is_file():
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if payload.get("version") != 1:
+            raise DatasetFormatError(f"unsupported validation manifest: {manifest_path}")
+        if int(payload.get("split_seed", -1)) != seed:
+            raise DatasetFormatError("validation manifest split_seed differs from configuration")
+        if abs(float(payload.get("validation_fraction", -1)) - validation_fraction) > 1e-12:
+            raise DatasetFormatError(
+                "validation manifest fraction differs from configuration"
+            )
+        validation_files: set[int] = set()
+        for entry in payload.get("validation_files", []):
+            root_index = int(entry["root"])
+            if not 0 <= root_index < len(resolved_roots):
+                raise DatasetFormatError("validation manifest contains an invalid root")
+            source = (resolved_roots[root_index] / str(entry["path"])).resolve()
+            if source not in file_lookup:
+                raise DatasetFormatError(f"validation file is missing from index: {source}")
+            validation_files.add(file_lookup[source])
+        if not validation_files or len(validation_files) >= len(index.files):
+            raise DatasetFormatError("validation manifest must leave files for training")
+        return validation_files
+
+    shuffled = list(range(len(index.files)))
+    random.Random(seed).shuffle(shuffled)
+    selected = set(shuffled[:validation_count])
+    payload = {
+        "version": 1,
+        "split_seed": seed,
+        "validation_fraction": validation_fraction,
+        "validation_files": [
+            _portable_file_entry(index.files[file_id], resolved_roots)
+            for file_id in sorted(selected)
+        ],
+    }
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return selected
+
+
+def _letterbox(
+    image: np.ndarray, image_size: int, preprocess_profile: str = "legacy"
+) -> Image.Image:
     if image.ndim != 2:
         raise DatasetFormatError(f"expected a grayscale image, got shape {image.shape}")
-    source = Image.fromarray(image, mode="L")
-    scale = min(image_size / source.width, image_size / source.height)
+    source = Image.fromarray(image)
+    if preprocess_profile == "legacy":
+        content_size = image_size
+    elif preprocess_profile == "margin_v1":
+        content_size = max(1, round(image_size * 11 / 12))
+    else:
+        raise ValueError(f"unknown preprocess profile: {preprocess_profile}")
+    scale = min(content_size / source.width, content_size / source.height)
     width = max(1, round(source.width * scale))
     height = max(1, round(source.height * scale))
     resized = source.resize((width, height), Image.Resampling.BILINEAR)
@@ -217,13 +301,19 @@ def _letterbox(image: np.ndarray, image_size: int) -> Image.Image:
     return canvas
 
 
-def build_image_transform(image_size: int, augment: bool = False) -> transforms.Compose:
+def build_image_transform(
+    image_size: int,
+    augment: bool = False,
+    augmentation_profile: str = "legacy",
+) -> transforms.Compose:
     """构建训练或推理阶段的无翻转字符图像变换。"""
 
     if image_size < 8:
         raise ValueError("image_size must be at least 8")
     steps: list[object] = []
-    if augment:
+    if augmentation_profile not in {"legacy", "gentle_elastic"}:
+        raise ValueError(f"unknown augmentation profile: {augmentation_profile}")
+    if augment and augmentation_profile == "legacy":
         steps.append(
             transforms.RandomAffine(
                 degrees=10,
@@ -231,6 +321,21 @@ def build_image_transform(image_size: int, augment: bool = False) -> transforms.
                 scale=(0.9, 1.1),
                 fill=255,
             )
+        )
+    elif augment:
+        steps.extend(
+            [
+                transforms.RandomAffine(
+                    degrees=7,
+                    translate=(0.05, 0.05),
+                    scale=(0.92, 1.08),
+                    fill=255,
+                ),
+                transforms.RandomApply(
+                    [transforms.ElasticTransform(alpha=8.0, sigma=4.0, fill=255)],
+                    p=0.25,
+                ),
+            ]
         )
     steps.extend(
         [
@@ -245,11 +350,15 @@ def preprocess_image(
     image: Image.Image | np.ndarray,
     image_size: int,
     augment: bool = False,
+    preprocess_profile: str = "legacy",
+    augmentation_profile: str = "legacy",
 ) -> Tensor:
     """使用与训练集相同的 letterbox、归一化和可选增强处理图片。"""
 
     array = np.asarray(image.convert("L") if isinstance(image, Image.Image) else image)
-    return build_image_transform(image_size, augment=augment)(_letterbox(array, image_size))
+    return build_image_transform(
+        image_size, augment=augment, augmentation_profile=augmentation_profile
+    )(_letterbox(array, image_size, preprocess_profile))
 
 
 class GNTDataset(Dataset[tuple[Tensor, int]]):
@@ -261,6 +370,8 @@ class GNTDataset(Dataset[tuple[Tensor, int]]):
         image_size: int = 96,
         augment: bool = False,
         record_indices: Sequence[int] | None = None,
+        preprocess_profile: str = "legacy",
+        augmentation_profile: str = "legacy",
     ) -> None:
         self.index = index
         self.image_size = image_size
@@ -269,7 +380,10 @@ class GNTDataset(Dataset[tuple[Tensor, int]]):
         )
         if any(i < 0 or i >= len(index.records) for i in self.record_indices):
             raise IndexError("record_indices contains an invalid record number")
-        self.transform = build_image_transform(image_size, augment=augment)
+        self.preprocess_profile = preprocess_profile
+        self.transform = build_image_transform(
+            image_size, augment=augment, augmentation_profile=augmentation_profile
+        )
         self._handles: dict[int, BinaryIO] = {}
 
     def __len__(self) -> int:
@@ -303,4 +417,11 @@ class GNTDataset(Dataset[tuple[Tensor, int]]):
 
     def __getitem__(self, item: int) -> tuple[Tensor, int]:
         record = self.index.records[self.record_indices[item]]
-        return self.transform(_letterbox(self._read_image(record), self.image_size)), record.label
+        image = _letterbox(self._read_image(record), self.image_size, self.preprocess_profile)
+        return self.transform(image), record.label
+
+    def raw_image(self, item: int) -> np.ndarray:
+        """读取指定数据集项的原始灰度图，用于错误样本分析。"""
+
+        record = self.index.records[self.record_indices[item]]
+        return self._read_image(record)

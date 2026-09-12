@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
@@ -135,6 +136,97 @@ class HCCR9Layer(nn.Module):
         return self.classifier(self.features(inputs))
 
 
+class IdentityChannelAttention(nn.Module):
+    """恒等初始化的通道注意力，便于从旧模型无损迁移。"""
+
+    def __init__(self, channels: int, reduction: int = 16) -> None:
+        super().__init__()
+        hidden = max(8, channels // reduction)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Conv2d(channels, hidden, 1)
+        self.activation = nn.PReLU(hidden)
+        self.fc2 = nn.Conv2d(hidden, channels, 1)
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        scale = 2.0 * torch.sigmoid(self.fc2(self.activation(self.fc1(self.pool(inputs)))))
+        return inputs * scale
+
+
+class HCCR9ResidualAttention(HCCR9Layer):
+    """保持九层主体的残差注意力增强模型。"""
+
+    def __init__(self, num_classes: int, dropout: float = 0.5) -> None:
+        super().__init__(num_classes, dropout)
+        self.attention160 = IdentityChannelAttention(160)
+        self.attention256 = IdentityChannelAttention(256)
+        self.attention384 = IdentityChannelAttention(384)
+        self.residual_gate256 = nn.Parameter(torch.zeros(()))
+        self.residual_gate384 = nn.Parameter(torch.zeros(()))
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        x = self.features[1](self.features[0](inputs))
+        x = self.features[3](self.features[2](x))
+        x = self.attention160(self.features[4](x))
+        x = self.features[5](x)
+        stage_input = self.features[6](x)
+        x = self.features[7](stage_input) + self.residual_gate256 * stage_input
+        x = self.features[8](self.attention256(x))
+        stage_input = self.features[9](x)
+        x = self.features[10](stage_input) + self.residual_gate384 * stage_input
+        return self.classifier(self.features[11](self.attention384(x)))
+
+
+class HCCR9ResidualAttentionWide(nn.Module):
+    """参数量受控的宽版九层残差注意力模型。"""
+
+    def __init__(self, num_classes: int, dropout: float = 0.5) -> None:
+        super().__init__()
+        if num_classes < 2:
+            raise ValueError("num_classes must be at least 2")
+        self.features = nn.Sequential(
+            PaperConvBlock(1, 128),
+            nn.MaxPool2d(3, stride=2, padding=1),
+            PaperConvBlock(128, 160),
+            nn.MaxPool2d(3, stride=2, padding=1),
+            PaperConvBlock(160, 192),
+            nn.MaxPool2d(3, stride=2, padding=1),
+            PaperConvBlock(192, 320),
+            PaperConvBlock(320, 320),
+            nn.MaxPool2d(3, stride=2, padding=1),
+            PaperConvBlock(320, 512),
+            PaperConvBlock(512, 512),
+            nn.MaxPool2d(3, stride=2, padding=1),
+        )
+        self.attention192 = IdentityChannelAttention(192)
+        self.attention320 = IdentityChannelAttention(320)
+        self.attention512 = IdentityChannelAttention(512)
+        self.residual_gate320 = nn.Parameter(torch.zeros(()))
+        self.residual_gate512 = nn.Parameter(torch.zeros(()))
+        self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool2d((3, 3)),
+            nn.Flatten(),
+            nn.Linear(512 * 3 * 3, 1280),
+            SafeBatchNorm1d(1280),
+            nn.PReLU(1280),
+            nn.Dropout(dropout),
+            nn.Linear(1280, num_classes),
+        )
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        x = self.features[1](self.features[0](inputs))
+        x = self.features[3](self.features[2](x))
+        x = self.attention192(self.features[4](x))
+        x = self.features[5](x)
+        stage_input = self.features[6](x)
+        x = self.features[7](stage_input) + self.residual_gate320 * stage_input
+        x = self.features[8](self.attention320(x))
+        stage_input = self.features[9](x)
+        x = self.features[10](stage_input) + self.residual_gate512 * stage_input
+        return self.classifier(self.features[11](self.attention512(x)))
+
+
 def create_model(name: str, num_classes: int) -> nn.Module:
     """根据 checkpoint/CLI 名称构建模型。"""
 
@@ -143,12 +235,21 @@ def create_model(name: str, num_classes: int) -> nn.Module:
     normalized = name.lower().strip().replace("-", "_")
     if normalized in {"hccr_cnn9", "hccr_cnn9layer", "hccr9"}:
         return HCCR9Layer(num_classes)
+    if normalized in {"hccr_cnn9_ra", "hccr9_ra"}:
+        return HCCR9ResidualAttention(num_classes)
+    if normalized in {"hccr_cnn9_ra_wide", "hccr9_ra_wide"}:
+        return HCCR9ResidualAttentionWide(num_classes)
     if normalized in {"cnn", "handwritten_cnn"}:
         return HandwrittenCNN(num_classes)
-    raise ValueError(f"unknown model '{name}'; choose hccr_cnn9 or cnn")
+    raise ValueError(
+        f"unknown model '{name}'; choose hccr_cnn9, hccr_cnn9_ra, "
+        "hccr_cnn9_ra_wide or cnn"
+    )
 
 
 MODEL_BUILDERS: dict[str, Callable[[int], nn.Module]] = {
     "hccr_cnn9": HCCR9Layer,
+    "hccr_cnn9_ra": HCCR9ResidualAttention,
+    "hccr_cnn9_ra_wide": HCCR9ResidualAttentionWide,
     "cnn": HandwrittenCNN,
 }

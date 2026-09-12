@@ -9,7 +9,10 @@ import pytest
 import torch
 from PIL import Image
 
+from compression import replace_conv_with_gslre
 from config import TrainConfig
+from error_analysis import analyze_checkpoint
+from model import create_model
 from predict import predict_image
 from train import evaluate_checkpoint, fit, load_checkpoint
 
@@ -87,6 +90,16 @@ def test_fit_evaluate_and_predict_round_trip(tmp_path: Path) -> None:
     assert prediction["prediction"] in {"A", "B"}
     assert len(prediction["top_k"]) == 2
 
+    analysis = analyze_checkpoint(
+        checkpoint,
+        config,
+        output_dir=tmp_path / "analysis",
+        max_errors=2,
+    )
+    assert analysis["split"] == "validation"
+    assert analysis["samples"] == 2
+    assert (tmp_path / "analysis" / "analysis.json").is_file()
+
     resumed_config = replace(
         config,
         output_dir=tmp_path / "resumed-outputs",
@@ -98,6 +111,10 @@ def test_fit_evaluate_and_predict_round_trip(tmp_path: Path) -> None:
     assert resumed["history"][0]["epoch"] == 2
 
     source_payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    assert source_payload["primary_weight_source"] == "ema"
+    assert source_payload["ema_model_state"] is not None
+    assert source_payload["training_model_state"] is not None
+    assert source_payload["validation_split"]["split_seed"] == 42
     resumed_payload = torch.load(
         resumed_config.output_dir / "last.pt", map_location="cpu", weights_only=False
     )
@@ -160,3 +177,67 @@ def test_finetune_starts_at_epoch_one_with_new_learning_rate(tmp_path: Path) -> 
         "checkpoint": str(source_checkpoint.resolve()),
         "epoch": 1,
     }
+
+
+def test_warm_start_records_source_and_transfer_coverage(tmp_path: Path) -> None:
+    train_roots, test_root, _ = _make_fixture(tmp_path)
+    source_config = TrainConfig(
+        train_roots=train_roots,
+        test_root=test_root,
+        cache_dir=tmp_path / "cache",
+        output_dir=tmp_path / "source",
+        model_name="hccr_cnn9",
+        image_size=16,
+        batch_size=2,
+        epochs=1,
+        warmup_epochs=0,
+        val_fraction=0.5,
+        num_workers=0,
+        device="cpu",
+        expected_num_classes=2,
+        max_train_batches=1,
+        max_eval_batches=1,
+    )
+    fit(source_config)
+    source_checkpoint = source_config.output_dir / "best.pt"
+    target_config = replace(
+        source_config,
+        output_dir=tmp_path / "warm-started",
+        model_name="hccr_cnn9_ra",
+        warm_start_from=source_checkpoint,
+    )
+
+    result = fit(target_config)
+    payload = torch.load(
+        target_config.output_dir / "last.pt", map_location="cpu", weights_only=False
+    )
+
+    expected_source = {"checkpoint": str(source_checkpoint.resolve()), "epoch": 1}
+    assert result["warm_start_source"] == expected_source
+    assert payload["warm_start_source"] == expected_source
+    assert float(payload["warm_start_report"]["coverage"]) > 0.99
+
+
+def test_residual_attention_gslre_checkpoint_round_trip(tmp_path: Path) -> None:
+    model = create_model("hccr_cnn9_ra", 2)
+    replaced = replace_conv_with_gslre(model, rank_ratio=0.5)
+    checkpoint = tmp_path / "ra-gslre.pt"
+    torch.save(
+        {
+            "format_version": 3,
+            "model_name": "hccr_cnn9_ra_gslre",
+            "gslre_rank_ratio": 0.5,
+            "class_names": ["A", "B"],
+            "class_to_idx": {"A": 0, "B": 1},
+            "image_size": 16,
+            "model_state": model.state_dict(),
+        },
+        checkpoint,
+    )
+
+    restored, metadata = load_checkpoint(checkpoint)
+    restored.eval()
+
+    assert replaced == 7
+    assert metadata["model_name"] == "hccr_cnn9_ra_gslre"
+    assert restored(torch.randn(1, 1, 16, 16)).shape == (1, 2)

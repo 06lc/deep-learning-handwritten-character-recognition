@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import random
 from pathlib import Path
@@ -44,6 +45,28 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
+
+class ExponentialMovingAverage:
+    """保存模型参数的指数滑动平均副本。"""
+
+    def __init__(self, model: nn.Module, decay: float) -> None:
+        self.decay = decay
+        self.model = copy.deepcopy(model).eval()
+        self.model.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        current = model.state_dict()
+        for name, averaged in self.model.state_dict().items():
+            value = current[name].detach()
+            if averaged.is_floating_point():
+                averaged.mul_(self.decay).add_(value, alpha=1.0 - self.decay)
+            else:
+                averaged.copy_(value)
+
+    def load_state_dict(self, state: dict[str, Tensor]) -> None:
+        self.model.load_state_dict(state)
 
 
 def prepare_indexes(config: TrainConfig) -> tuple[GNTIndex, GNTIndex]:
@@ -98,11 +121,28 @@ def make_loader(
 def make_train_validation_loaders(
     index: GNTIndex, config: TrainConfig, device: torch.device
 ) -> tuple[DataLoader[tuple[Tensor, Tensor]], DataLoader[tuple[Tensor, Tensor]]]:
+    assert config.validation_manifest is not None
     train_indices, validation_indices = split_record_indices_by_file(
-        index, config.val_fraction, config.seed
+        index,
+        config.val_fraction,
+        config.split_seed,
+        manifest_path=config.validation_manifest,
+        roots=config.train_roots,
     )
-    train_set = GNTDataset(index, config.image_size, augment=True, record_indices=train_indices)
-    validation_set = GNTDataset(index, config.image_size, record_indices=validation_indices)
+    train_set = GNTDataset(
+        index,
+        config.image_size,
+        augment=True,
+        record_indices=train_indices,
+        preprocess_profile=config.preprocess_profile,
+        augmentation_profile=config.augmentation_profile,
+    )
+    validation_set = GNTDataset(
+        index,
+        config.image_size,
+        record_indices=validation_indices,
+        preprocess_profile=config.preprocess_profile,
+    )
     return (
         make_loader(train_set, config.batch_size, True, config.num_workers, device, config.seed),
         make_loader(validation_set, config.batch_size, False, config.num_workers, device, 0),
@@ -126,6 +166,7 @@ def run_epoch(
     optimizer: torch.optim.Optimizer | None = None,
     scaler: torch.amp.GradScaler | None = None,
     max_batches: int | None = None,
+    ema: ExponentialMovingAverage | None = None,
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -150,6 +191,8 @@ def run_epoch(
                 else:
                     loss.backward()
                     optimizer.step()
+                if ema is not None:
+                    ema.update(model)
         count, top1, top5 = _batch_metrics(logits.detach(), targets)
         total_loss += float(loss.detach()) * count
         total_count += count
@@ -165,9 +208,11 @@ def run_epoch(
 
 
 def _optimizer_and_scheduler(
-    model: nn.Module, config: TrainConfig
+    model: nn.Module,
+    config: TrainConfig,
+    resume_scheduler_state: dict[str, Any] | None = None,
 ) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler]:
-    if config.finetune_from is not None:
+    if config.finetune_from is not None or config.warm_start_from is not None:
         optimizer: torch.optim.Optimizer = torch.optim.AdamW(
             model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
         )
@@ -186,9 +231,49 @@ def _optimizer_and_scheduler(
         )
     else:
         raise ValueError("recipe must be 'modern' or 'paper'")
-    # 按总训练轮数做余弦退火，避免后期学习率过大破坏已学到的笔画特征。
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, config.epochs))
+    if resume_scheduler_state and "T_max" in resume_scheduler_state:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(1, config.epochs)
+        )
+        return optimizer, scheduler
+
+    warmup_epochs = min(config.warmup_epochs, max(0, config.epochs - 1))
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, config.epochs - warmup_epochs),
+        eta_min=config.min_learning_rate,
+    )
+    if warmup_epochs == 0:
+        scheduler = cosine
+    else:
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs]
+        )
     return optimizer, scheduler
+
+
+def warm_start_model(model: nn.Module, source_state: dict[str, Tensor]) -> dict[str, object]:
+    """复制名称和形状都匹配的参数，并返回可审计的迁移报告。"""
+
+    target_state = model.state_dict()
+    matched = {
+        name: value
+        for name, value in source_state.items()
+        if name in target_state and target_state[name].shape == value.shape
+    }
+    model.load_state_dict(matched, strict=False)
+    copied_parameters = sum(target_state[name].numel() for name in matched)
+    total_parameters = sum(value.numel() for value in target_state.values())
+    return {
+        "copied_tensors": len(matched),
+        "total_tensors": len(target_state),
+        "copied_parameters": copied_parameters,
+        "total_parameters": total_parameters,
+        "coverage": copied_parameters / total_parameters,
+    }
 
 
 def save_checkpoint(
@@ -203,22 +288,38 @@ def save_checkpoint(
     metrics: dict[str, float],
     model_name: str | None = None,
     extra: dict[str, Any] | None = None,
+    ema: ExponentialMovingAverage | None = None,
+    primary_is_ema: bool = False,
 ) -> None:
+    raw_state = model.state_dict()
+    ema_state = ema.model.state_dict() if ema is not None else None
+    validation_split = None
+    if config.validation_manifest is not None and config.validation_manifest.is_file():
+        validation_split = json.loads(config.validation_manifest.read_text(encoding="utf-8"))
     payload: dict[str, Any] = {
-        "format_version": 2,
+        "format_version": 3,
         "model_name": model_name or config.model_name,
         "class_names": list(class_names),
         "class_to_idx": {name: i for i, name in enumerate(class_names)},
         "image_size": config.image_size,
         "normalization": {"mean": [0.5], "std": [0.5]},
+        "preprocessing": {
+            "profile": config.preprocess_profile,
+            "augmentation_profile": config.augmentation_profile,
+        },
         "config": config.as_dict(),
         "dataset": {
             "train_roots": [str(p.resolve()) for p in config.train_roots],
             "test_root": str(config.test_root.resolve()),
         },
+        "validation_split": validation_split,
         "epoch": epoch,
         "metrics": metrics,
-        "model_state": model.state_dict(),
+        "model_state": ema_state if primary_is_ema and ema_state is not None else raw_state,
+        "training_model_state": raw_state,
+        "ema_model_state": ema_state,
+        "primary_weight_source": "ema" if primary_is_ema and ema_state is not None else "raw",
+        "scheduler_name": type(scheduler).__name__ if scheduler is not None else None,
         "optimizer_state": optimizer.state_dict() if optimizer is not None else None,
         "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
         "scaler_state": scaler.state_dict() if scaler is not None else None,
@@ -264,7 +365,48 @@ def fit(config: TrainConfig) -> dict[str, object]:
     train_index, _ = prepare_indexes(config)
     train_loader, validation_loader = make_train_validation_loaders(train_index, config, device)
     model = create_model(config.model_name, len(train_index.class_names)).to(device)
-    optimizer, scheduler = _optimizer_and_scheduler(model, config)
+    source_path = config.resume or config.finetune_from or config.warm_start_from
+    source_payload: dict[str, Any] | None = None
+    source_metadata: dict[str, object] | None = None
+    if source_path is not None:
+        resolved_source = source_path.resolve()
+        if not resolved_source.is_file():
+            raise FileNotFoundError(f"checkpoint does not exist: {resolved_source}")
+        source_payload = torch.load(resolved_source, map_location=device, weights_only=False)
+        if tuple(source_payload.get("class_names", ())) != train_index.class_names:
+            raise ValueError("checkpoint class mapping differs from current data")
+        source_metadata = {
+            "checkpoint": str(resolved_source),
+            "epoch": int(source_payload.get("epoch", 0)),
+        }
+
+    warm_start_report: dict[str, object] | None = None
+    if config.resume is not None and source_payload is not None:
+        model.load_state_dict(
+            source_payload.get("training_model_state", source_payload["model_state"])
+        )
+    elif config.finetune_from is not None and source_payload is not None:
+        source_model_name = str(source_payload.get("model_name", "cnn"))
+        if source_model_name != config.model_name:
+            raise ValueError(
+                "fine-tune checkpoint model differs from configured model: "
+                f"{source_model_name!r} != {config.model_name!r}"
+            )
+        model.load_state_dict(source_payload["model_state"])
+    elif config.warm_start_from is not None and source_payload is not None:
+        if config.model_name != "hccr_cnn9_ra":
+            raise ValueError("warm-start is supported only for hccr_cnn9_ra")
+        if str(source_payload.get("model_name")) != "hccr_cnn9":
+            raise ValueError("warm-start source must be an hccr_cnn9 checkpoint")
+        warm_start_report = warm_start_model(model, source_payload["model_state"])
+
+    ema = ExponentialMovingAverage(model, config.ema_decay) if config.ema_decay > 0 else None
+    resume_scheduler_state = (
+        source_payload.get("scheduler_state")
+        if config.resume is not None and source_payload is not None
+        else None
+    )
+    optimizer, scheduler = _optimizer_and_scheduler(model, config, resume_scheduler_state)
     scaler = torch.amp.GradScaler("cuda", enabled=config.amp and device.type == "cuda")
     criterion = nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
     config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -272,44 +414,44 @@ def fit(config: TrainConfig) -> dict[str, object]:
     best_top1 = -1.0
     stale_epochs = 0
     start_epoch = 1
-    finetune_source: dict[str, object] | None = None
-    if config.resume is not None:
-        resume_payload = torch.load(config.resume, map_location=device, weights_only=False)
-        if tuple(resume_payload.get("class_names", ())) != train_index.class_names:
-            raise ValueError("resume checkpoint class mapping differs from current data")
-        model.load_state_dict(resume_payload["model_state"])
-        if resume_payload.get("optimizer_state"):
-            optimizer.load_state_dict(resume_payload["optimizer_state"])
-        if resume_payload.get("scheduler_state"):
-            scheduler.load_state_dict(resume_payload["scheduler_state"])
-        if resume_payload.get("scaler_state"):
-            scaler.load_state_dict(resume_payload["scaler_state"])
-        start_epoch = int(resume_payload.get("epoch", 0)) + 1
-        best_top1 = float(resume_payload.get("metrics", {}).get("top1", -1.0))
-    elif config.finetune_from is not None:
-        source = config.finetune_from.resolve()
-        finetune_payload = torch.load(source, map_location=device, weights_only=False)
-        if tuple(finetune_payload.get("class_names", ())) != train_index.class_names:
-            raise ValueError("fine-tune checkpoint class mapping differs from current data")
-        source_model_name = str(finetune_payload.get("model_name", "cnn"))
-        if source_model_name != config.model_name:
-            raise ValueError(
-                "fine-tune checkpoint model differs from configured model: "
-                f"{source_model_name!r} != {config.model_name!r}"
-            )
-        model.load_state_dict(finetune_payload["model_state"])
-        finetune_source = {
-            "checkpoint": str(source),
-            "epoch": int(finetune_payload.get("epoch", 0)),
-        }
+    if config.resume is not None and source_payload is not None:
+        if source_payload.get("ema_model_state") and ema is not None:
+            ema.load_state_dict(source_payload["ema_model_state"])
+        if source_payload.get("optimizer_state"):
+            optimizer.load_state_dict(source_payload["optimizer_state"])
+        if source_payload.get("scheduler_state"):
+            scheduler.load_state_dict(source_payload["scheduler_state"])
+        if source_payload.get("scaler_state"):
+            scaler.load_state_dict(source_payload["scaler_state"])
+        start_epoch = int(source_payload.get("epoch", 0)) + 1
+        best_top1 = float(source_payload.get("metrics", {}).get("top1", -1.0))
+
+    checkpoint_extra: dict[str, Any] = {}
+    if config.finetune_from is not None:
+        checkpoint_extra["finetune_source"] = source_metadata
+    if config.warm_start_from is not None:
+        checkpoint_extra["warm_start_source"] = source_metadata
+        checkpoint_extra["warm_start_report"] = warm_start_report
 
     for epoch in range(start_epoch, config.epochs + 1):
         train_metrics = run_epoch(
-            model, train_loader, criterion, device, optimizer, scaler, config.max_train_batches
+            model,
+            train_loader,
+            criterion,
+            device,
+            optimizer,
+            scaler,
+            config.max_train_batches,
+            ema,
         )
+        validation_model = ema.model if ema is not None else model
         with torch.inference_mode():
             validation_metrics = run_epoch(
-                model, validation_loader, criterion, device, max_batches=config.max_eval_batches
+                validation_model,
+                validation_loader,
+                criterion,
+                device,
+                max_batches=config.max_eval_batches,
             )
         scheduler.step()
         epoch_result = {
@@ -329,7 +471,8 @@ def fit(config: TrainConfig) -> dict[str, object]:
             train_index.class_names,
             epoch,
             validation_metrics,
-            extra={"finetune_source": finetune_source} if finetune_source else None,
+            extra=checkpoint_extra,
+            ema=ema,
         )
         if validation_metrics["top1"] > best_top1:
             best_top1 = validation_metrics["top1"]
@@ -344,13 +487,16 @@ def fit(config: TrainConfig) -> dict[str, object]:
                 train_index.class_names,
                 epoch,
                 validation_metrics,
-                extra={"finetune_source": finetune_source} if finetune_source else None,
+                extra=checkpoint_extra,
+                ema=ema,
+                primary_is_ema=True,
             )
         else:
             stale_epochs += 1
             if stale_epochs >= config.patience:
                 break
 
+    assert config.validation_manifest is not None
     result: dict[str, object] = {
         "device": str(device),
         "model_name": config.model_name,
@@ -358,10 +504,11 @@ def fit(config: TrainConfig) -> dict[str, object]:
         "train_samples": len(train_loader.dataset),
         "validation_samples": len(validation_loader.dataset),
         "best_validation_top1": best_top1,
+        "validation_manifest": str(config.validation_manifest.resolve()),
+        "validation_weight_source": "ema" if ema is not None else "raw",
         "history": history,
     }
-    if finetune_source is not None:
-        result["finetune_source"] = finetune_source
+    result.update(checkpoint_extra)
     (config.output_dir / "history.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -382,13 +529,22 @@ def evaluate_checkpoint(
         output_dir=config.output_dir,
         model_name=str(payload.get("model_name", "cnn")),
         image_size=int(payload.get("image_size", checkpoint_config.get("image_size", 96))),
+        preprocess_profile=str(
+            payload.get("preprocessing", {}).get(
+                "profile", checkpoint_config.get("preprocess_profile", "legacy")
+            )
+        ),
         expected_num_classes=len(class_names),
         rebuild_index=config.rebuild_index,
     )
     _, test_index = prepare_indexes(test_config)
     if test_index.class_names != class_names:
         raise ValueError("test labels do not match checkpoint class mapping")
-    test_set = GNTDataset(test_index, image_size=test_config.image_size)
+    test_set = GNTDataset(
+        test_index,
+        image_size=test_config.image_size,
+        preprocess_profile=test_config.preprocess_profile,
+    )
     loader = make_loader(test_set, config.batch_size, False, config.num_workers, device, 0)
     criterion = nn.CrossEntropyLoss()
     with torch.inference_mode():
