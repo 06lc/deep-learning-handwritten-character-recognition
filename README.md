@@ -3,6 +3,31 @@
 这是一个面向 AutoDL GPU 的 PyTorch 单字符中文手写识别系统。默认采用论文
 HCCR-CNN9Layer：`96x96` 输入、7 个卷积层、PReLU、1024 维全连接层和 3926 类输出。
 
+## 当前最佳模型
+
+当前已验证最佳模型为 HWDB1.0 兼容数据扩充实验 D1：
+
+```text
+模型：HCCR-CNN9Layer
+输入：96x96
+类别：3926
+起始权重：outputs/full/best.pt
+训练数据：844,792 个 HWDB1.1 样本 + 1,303,957 个兼容 HWDB1.0 样本
+固定验证集：93,887 个 HWDB1.1 样本
+最佳轮次：30
+固定验证 Top-1：95.5521%
+固定验证 Top-5：99.2139%
+HWDB1.1 官方 Test Top-1：96.6592%
+HWDB1.1 官方 Test Top-5：99.5299%
+HWDB1.1 官方 Test Loss：0.20338
+HWDB1.0 共有类别 Test Top-1：97.5525%
+checkpoint：outputs/data-expansion/d1-warm/best.pt
+```
+
+原始 HWDB1.1 基线的官方 Test Top-1 为 `96.2609%`。D1 提高了约 `0.3983`
+个百分点；两个数据集的 Test 指标独立报告，不合并计算。checkpoint 位于 AutoDL
+训练输出目录，不纳入 Git。
+
 ## 数据布局
 
 训练集和测试集必须放在项目目录内，目录名保持不变：

@@ -3,6 +3,19 @@
 所有命令均在 `/root/autodl-tmp/hwdb-recognizer` 执行。保留
 `outputs/full/best.pt` 作为 Top-1 96.2609% 的基线，实验期间只比较固定验证集。
 
+## 已完成结果
+
+| 实验 | 最佳轮次 | 固定验证 Top-1 | HWDB1.1 Test Top-1 | HWDB1.1 Test Top-5 | 结论 |
+|---|---:|---:|---:|---:|---|
+| 原始基线 | 29 | 94.8832% | 96.2609% | 99.3942% | 原始权重基线 |
+| E1-schedule | 49 | 95.0323% | 未评估 | 未评估 | 调度与 EMA 收益有限 |
+| D1-data-expansion | 30 | 95.5521% | 96.6592% | 99.5299% | 当前最佳模型 |
+
+D1 使用 `outputs/full/best.pt` 作为起始权重，以 `1e-4` 学习率重新创建 AdamW、
+学习率调度器和 AMP 状态。实际梯度训练样本为 2,148,749 个，checkpoint 位于
+`outputs/data-expansion/d1-warm/best.pt`。其 HWDB1.0 共有类别 Test Top-1 为
+`97.5525%`，该结果不与 HWDB1.1 Test 合并。D2 使用随机种子 `2026` 进行复验。
+
 ## 0. 上传和烟测
 
 上传本次变更的源码与测试后执行：
