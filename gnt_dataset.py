@@ -16,6 +16,8 @@ from torch import Tensor
 from torch.utils.data import Dataset
 from torchvision import transforms
 
+# GNT 每条记录的前 10 个字节：记录总长度、两字节标签、图像宽度和高度。
+# < 表示小端字节序，I/2s/H/H 分别对应 uint32、2 字节、uint16、uint16。
 GNT_HEADER = struct.Struct("<I2sHH")
 NORMALIZE_MEAN = (0.5,)
 NORMALIZE_STD = (0.5,)
@@ -62,7 +64,11 @@ class GNTIndex:
 
 
 def decode_label(raw_label: bytes) -> str:
-    """把 GNT 的两个字节 GBK 标签转成一个 Unicode 字符。"""
+    """把 GNT 的两个字节 GBK 标签转成一个 Unicode 字符。
+
+    GNT 标签不是整数类别编号，而是字符编码。例如两个 GBK 字节解码后可能
+    得到“坐”。模型训练时再把这个字符映射成 0 到 3925 的整数类别编号。
+    """
 
     try:
         label = raw_label.decode("gbk").rstrip("\x00")
@@ -83,6 +89,8 @@ def _label_sort_key(label: str) -> bytes:
 
 
 def gnt_files(roots: Sequence[str | Path]) -> tuple[Path, ...]:
+    """收集目录下的 GNT 文件，并按路径排序保证顺序稳定。"""
+
     if isinstance(roots, (str, Path)):
         roots = (roots,)
     files: list[Path] = []
@@ -103,7 +111,11 @@ def build_index(
     *,
     unknown_label: str = "error",
 ) -> GNTIndex:
-    """扫描 GNT 记录头并建立可复用索引，不读取像素正文。"""
+    """扫描 GNT 记录头并建立可复用索引，不读取像素正文。
+
+    索引只记录“图像在哪个文件、从哪个字节开始、尺寸是多少、标签是什么”。
+    训练时再按偏移读取像素，因此避免把百万张图片转换成独立文件。
+    """
 
     if unknown_label not in {"error", "skip"}:
         raise ValueError("unknown_label must be 'error' or 'skip'")
@@ -123,6 +135,7 @@ def build_index(
     )
 
     for file_id, path in enumerate(files):
+        # 一个 GNT 文件由许多条连续记录组成；handle.tell() 是当前记录的起点。
         file_size = path.stat().st_size
         with path.open("rb") as handle:
             while handle.tell() < file_size:
@@ -132,6 +145,7 @@ def build_index(
                     raise DatasetFormatError(f"truncated GNT header: {path} at {offset}")
                 sample_size, raw_label, width, height = GNT_HEADER.unpack(header)
                 pixel_size = width * height
+                # 正常记录的总长度必须等于“头部 10 字节 + 像素字节数”。
                 if sample_size != GNT_HEADER.size + pixel_size:
                     raise DatasetFormatError(
                         f"invalid sample size in {path} at {offset}: "
@@ -176,7 +190,11 @@ def build_index(
 
 
 def merge_indexes(primary: GNTIndex, additional: GNTIndex) -> GNTIndex:
-    """合并相同类别映射的索引，并重排附加记录的文件编号。"""
+    """合并相同类别映射的索引，并重排附加记录的文件编号。
+
+    附加索引的 file_id 从 0 开始，所以合并时必须整体加上主索引文件数，
+    否则训练会把一条记录指向错误的 GNT 文件。
+    """
 
     if primary.class_names != additional.class_names:
         raise DatasetFormatError("cannot merge GNT indexes with different class mappings")
@@ -392,6 +410,11 @@ def _load_or_create_validation_files(
 def _letterbox(
     image: np.ndarray, image_size: int, preprocess_profile: str = "legacy"
 ) -> Image.Image:
+    """等比例缩放字符，并把它放到固定大小的白色画布中央。
+
+    直接拉伸会改变汉字笔画比例；letterbox 只缩放较长边，另一边用白边补齐，
+    因而既能统一输入尺寸，又尽量保留原始字形。
+    """
     if image.ndim != 2:
         raise DatasetFormatError(f"expected a grayscale image, got shape {image.shape}")
     source = Image.fromarray(image)
@@ -415,7 +438,11 @@ def build_image_transform(
     augment: bool = False,
     augmentation_profile: str = "legacy",
 ) -> transforms.Compose:
-    """构建训练或推理阶段的无翻转字符图像变换。"""
+    """构建训练或推理阶段的图像变换。
+
+    训练时可以加入轻微仿射扰动；推理时不做随机增强。最后 ToTensor 把像素
+    从 HxW 变成 1xHxW，并把 [0, 255] 映射到浮点数后进行标准化。
+    """
 
     if image_size < 8:
         raise ValueError("image_size must be at least 8")
@@ -525,6 +552,8 @@ class GNTDataset(Dataset[tuple[Tensor, int]]):
         return np.frombuffer(pixels, dtype=np.uint8).reshape(height, width).copy()
 
     def __getitem__(self, item: int) -> tuple[Tensor, int]:
+        # PyTorch 的 DataLoader 会反复调用这里：item 是索引中的第几条记录，
+        # 返回值必须是“模型输入张量 + 目标类别整数”。
         record = self.index.records[self.record_indices[item]]
         image = _letterbox(self._read_image(record), self.image_size, self.preprocess_profile)
         return self.transform(image), record.label

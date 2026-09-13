@@ -1,9 +1,3 @@
-"""项目配置。
-
-路径始终相对于源码目录解析，因此同一份项目可以直接上传到 AutoDL；不会依赖
-Windows 的盘符，也不会把训练目录和测试目录混用。
-"""
-
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -11,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+# 所有默认路径都从项目目录推导。这样把整个项目上传到 AutoDL 后，代码仍然可用。
 TRAIN_ROOTS = (
     PROJECT_ROOT / "Gnt1.1TrainPart1",
     PROJECT_ROOT / "Gnt1.1TrainPart2",
@@ -29,7 +24,7 @@ DATA_PROFILES = ("hwdb11", "hwdb10_11_shared")
 TEST_PROFILES = ("hwdb11", "hwdb10_shared")
 SAMPLING_STRATEGIES = ("natural", "class-balanced")
 
-
+# 检查数据配置是否合理。
 def validate_dataset_paths(
     train_roots: tuple[Path, ...] = TRAIN_ROOTS,
     test_root: Path = TEST_ROOT,
@@ -76,7 +71,10 @@ def validate_config_paths(config: TrainConfig) -> None:
 
 @dataclass(slots=True)
 class TrainConfig:
-    """训练、验证和 checkpoint 所需的全部参数。"""
+    """
+    训练、验证和 checkpoint 所需的全部参数。
+
+    """
 
     train_roots: tuple[Path, ...] = TRAIN_ROOTS
     test_root: Path = TEST_ROOT
@@ -97,12 +95,12 @@ class TrainConfig:
     validation_manifest: Path | None = None
     # AdamW 的初始学习率；Cosine 调度器会在每轮后逐步降低它。
     learning_rate: float = 3e-4
-    warmup_epochs: int = 5
+    warmup_epochs: int = 5  # Cosine 调度器会在前 warmup_epochs 轮内线性增加学习率。
     min_learning_rate: float = 1e-6
     ema_decay: float = 0.9999
-    weight_decay: float = 1e-4
-    label_smoothing: float = 0.05
-    patience: int = 5
+    weight_decay: float = 1e-4 # L2 正则化。
+    label_smoothing: float = 0.05  # 标签平滑,让模型对错误标签不那么敏感。
+    patience: int = 5 # 早停。
     num_workers: int = 0
     seed: int = 42
     device: str = "auto"
@@ -143,6 +141,8 @@ class TrainConfig:
             raise ValueError(f"sampling_strategy must be one of {SAMPLING_STRATEGIES}")
 
     def as_dict(self) -> dict[str, Any]:
+        # checkpoint 需要保存可序列化的字符串路径，而不是 Windows/Linux
+        # 平台相关的 Path 对象。
         values = asdict(self)
         for key in ("train_roots", "additional_train_roots"):
             values[key] = [str(path) for path in values[key]]

@@ -29,6 +29,7 @@ from model import create_model
 
 
 def resolve_device(requested: str = "auto") -> torch.device:
+    """把命令行设备字符串解析成 PyTorch 设备对象。"""
     normalized = requested.lower().strip()
     if normalized == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -39,6 +40,7 @@ def resolve_device(requested: str = "auto") -> torch.device:
 
 
 def seed_everything(seed: int) -> None:
+    """固定随机数，让同一配置的实验尽量可以复现。"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -49,7 +51,11 @@ def seed_everything(seed: int) -> None:
 
 
 class ExponentialMovingAverage:
-    """保存模型参数的指数滑动平均副本。"""
+    """保存模型参数的指数滑动平均副本。
+
+    训练权重每一步都会有小幅波动；EMA 用新旧权重的加权平均得到更平滑的
+    模型，验证和保存 best.pt 时使用这份副本。
+    """
 
     def __init__(self, model: nn.Module, decay: float) -> None:
         self.decay = decay
@@ -241,6 +247,11 @@ def make_loader(
     seed: int,
     sample_weights: Tensor | None = None,
 ) -> DataLoader[tuple[Tensor, Tensor]]:
+    """把 Dataset 包装成按 batch 读取的 DataLoader。
+
+    batch_size 决定一次送入 GPU 的样本数；num_workers 决定后台读取进程数；
+    pin_memory 配合 CUDA 可以加快 CPU 到 GPU 的拷贝。
+    """
     generator = torch.Generator().manual_seed(seed)
     sampler = None
     if sample_weights is not None:
@@ -344,6 +355,11 @@ def run_epoch(
     max_batches: int | None = None,
     ema: ExponentialMovingAverage | None = None,
 ) -> dict[str, float]:
+    """运行一个完整的数据轮次。
+
+    optimizer 不为空表示训练模式：计算损失、反向传播并更新参数；optimizer
+    为空表示验证模式：只前向推理和统计指标，不修改模型。
+    """
     training = optimizer is not None
     model.train(training)
     amp_enabled = scaler is not None and scaler.is_enabled()
@@ -356,10 +372,14 @@ def run_epoch(
         if training:
             optimizer.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(training):
+            # autocast 在 GPU 上使用半精度计算，减少显存占用；scaler 防止
+            # 半精度下梯度太小而变成 0。CPU 或关闭 AMP 时走普通精度路径。
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
                 logits = model(images)
                 loss = criterion(logits, targets)
             if training:
+                # loss.backward() 计算每个参数的梯度；optimizer.step() 按梯度
+                # 和学习率更新参数；zero_grad() 会在下一个 batch 前清除旧梯度。
                 if scaler is not None and amp_enabled:
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
@@ -388,6 +408,8 @@ def _optimizer_and_scheduler(
     config: TrainConfig,
     resume_scheduler_state: dict[str, Any] | None = None,
 ) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler]:
+    # 优化器决定“如何根据梯度改参数”；调度器决定“每一轮使用多大的学习率”。
+    # --finetune-from 必须创建全新的优化器，避免把旧实验的动量带入新实验。
     if config.finetune_from is not None or config.warm_start_from is not None:
         optimizer: torch.optim.Optimizer = torch.optim.AdamW(
             model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
@@ -467,6 +489,7 @@ def save_checkpoint(
     ema: ExponentialMovingAverage | None = None,
     primary_is_ema: bool = False,
 ) -> None:
+    """把一次实验恢复所需的状态集中保存到一个 .pt 文件。"""
     raw_state = model.state_dict()
     ema_state = ema.model.state_dict() if ema is not None else None
     validation_split = None

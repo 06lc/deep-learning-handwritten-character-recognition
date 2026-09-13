@@ -28,6 +28,8 @@ checkpoint：outputs/data-expansion/d1-warm/best.pt
 个百分点；两个数据集的 Test 指标独立报告，不合并计算。checkpoint 位于 AutoDL
 训练输出目录，不纳入 Git。
 
+完整的四轮训练配置、数据规模和同口径指标对比见 [`MODEL_COMPARISON.md`](MODEL_COMPARISON.md)。
+
 ## 数据布局
 
 训练集和测试集必须放在项目目录内，目录名保持不变：

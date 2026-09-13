@@ -83,7 +83,11 @@ class HandwrittenCNN(nn.Module):
 
 
 class PaperConvBlock(nn.Module):
-    """论文中的 3x3 卷积、BN、PReLU 组合。"""
+    """论文中的 3x3 卷积、BN、PReLU 组合。
+
+    卷积负责从局部像素中提取笔画特征；BatchNorm 稳定数值分布；PReLU
+    提供非线性，使网络可以表示弯钩、交叉和复杂部件等模式。
+    """
 
     def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
@@ -133,6 +137,8 @@ class HCCR9Layer(nn.Module):
         )
 
     def forward(self, inputs: Tensor) -> Tensor:
+        # inputs 形状为 [batch, 1, 96, 96]。features 逐步降低空间尺寸、
+        # 提高通道数，把像素变成越来越抽象的笔画和部件特征。
         return self.classifier(self.features(inputs))
 
 
@@ -166,6 +172,8 @@ class HCCR9ResidualAttention(HCCR9Layer):
         self.residual_gate384 = nn.Parameter(torch.zeros(()))
 
     def forward(self, inputs: Tensor) -> Tensor:
+        # 这里显式写出每个阶段，是为了在原九层网络上插入注意力和残差连接。
+        # 两个 residual_gate 初始为 0，所以迁移训练刚开始时不会突然改变旧模型输出。
         x = self.features[1](self.features[0](inputs))
         x = self.features[3](self.features[2](x))
         x = self.attention160(self.features[4](x))
@@ -228,7 +236,11 @@ class HCCR9ResidualAttentionWide(nn.Module):
 
 
 def create_model(name: str, num_classes: int) -> nn.Module:
-    """根据 checkpoint/CLI 名称构建模型。"""
+    """根据 checkpoint/CLI 名称构建模型。
+
+    训练、评估、预测必须调用同一个工厂，否则同一个 checkpoint 可能被错误地
+    载入到另一种网络结构中。
+    """
 
     if num_classes < 2:
         raise ValueError("num_classes must be at least 2")
