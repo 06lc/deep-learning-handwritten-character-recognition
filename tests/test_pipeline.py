@@ -14,7 +14,7 @@ from config import TrainConfig
 from error_analysis import analyze_checkpoint
 from model import create_model
 from predict import predict_image
-from train import evaluate_checkpoint, fit, load_checkpoint
+from train import evaluate_checkpoint, fit, load_checkpoint, prepare_indexes, prepare_test_index
 
 
 def _write_gnt(path: Path, records: list[tuple[str, np.ndarray]]) -> None:
@@ -316,6 +316,35 @@ def test_hwdb10_shared_training_preserves_mapping_and_metadata(tmp_path: Path) -
     assert metrics["test_scanned_samples"] == 2
     assert metrics["test_accepted_samples"] == 1
     assert metrics["test_excluded_samples"] == 1
+
+
+def test_icdar2013_uses_a_separate_cached_test_index(tmp_path: Path) -> None:
+    train_roots, test_root, _ = _make_fixture(tmp_path)
+    competition_root = tmp_path / "competition-gnt"
+    competition_root.mkdir()
+    image = np.zeros((2, 2), dtype=np.uint8)
+    _write_gnt(competition_root / "C001-f-f.gnt", [("A", image), ("B", image)])
+    config = TrainConfig(
+        train_roots=train_roots,
+        test_root=test_root,
+        competition_test_root=competition_root,
+        test_profile="icdar2013",
+        cache_dir=tmp_path / "cache",
+        image_size=16,
+        expected_num_classes=2,
+        device="cpu",
+    )
+
+    train_index, _ = prepare_indexes(config)
+    test_index, report = prepare_test_index(config, train_index.class_names)
+
+    assert test_index.files == (competition_root.resolve() / "C001-f-f.gnt",)
+    assert len(test_index.records) == 2
+    assert report["test_profile"] == "icdar2013"
+    assert report["test_scanned_samples"] == 2
+    assert report["test_accepted_samples"] == 2
+    assert report["test_excluded_samples"] == 0
+    assert (config.cache_dir / "test_icdar2013.npz").is_file()
 
 
 def test_expanded_training_rejects_baseline_resume(tmp_path: Path) -> None:

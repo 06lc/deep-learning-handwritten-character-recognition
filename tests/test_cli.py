@@ -46,6 +46,19 @@ def test_cli_exposes_index_train_evaluate_and_predict_commands() -> None:
         ).test_profile
         == "hwdb10_shared"
     )
+    icdar_args = parser.parse_args(
+        [
+            "evaluate",
+            "--checkpoint",
+            "best.pt",
+            "--test-profile",
+            "icdar2013",
+            "--competition-test-root",
+            "competition-gnt",
+        ]
+    )
+    assert icdar_args.test_profile == "icdar2013"
+    assert icdar_args.competition_test_root == Path("competition-gnt")
     analyze_args = parser.parse_args(
         [
             "analyze",

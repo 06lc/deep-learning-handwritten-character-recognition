@@ -26,7 +26,8 @@ class SafeBatchNorm1d(nn.BatchNorm1d):
             )
         return super().forward(inputs)
 
-
+# 当前最佳模型 D1 使用的是 HCCR9Layer；下面的 ResidualBlock 只服务于旧的
+# HandwrittenCNN 兼容模型，当前最佳模型不会走到这里。
 class ResidualBlock(nn.Module):
     """两个卷积层和 shortcut 组成的残差块。"""
 
@@ -54,7 +55,10 @@ class ResidualBlock(nn.Module):
 
 
 class HandwrittenCNN(nn.Module):
-    """原项目的轻量模型，保留用于旧 checkpoint 兼容。"""
+    """原项目的轻量模型，保留用于旧 checkpoint 兼容。
+
+    当前最佳 D1 模型不使用这个类；学习主流程时可以先跳过。
+    """
 
     def __init__(self, num_classes: int, dropout: float = 0.2) -> None:
         super().__init__()
@@ -143,7 +147,10 @@ class HCCR9Layer(nn.Module):
 
 
 class IdentityChannelAttention(nn.Module):
-    """恒等初始化的通道注意力，便于从旧模型无损迁移。"""
+    """恒等初始化的通道注意力，便于从旧模型无损迁移。
+
+    当前最佳 D1 模型没有启用注意力；这是后续增强模型实验使用的组件。
+    """
 
     def __init__(self, channels: int, reduction: int = 16) -> None:
         super().__init__()
@@ -161,7 +168,10 @@ class IdentityChannelAttention(nn.Module):
 
 
 class HCCR9ResidualAttention(HCCR9Layer):
-    """保持九层主体的残差注意力增强模型。"""
+    """保持九层主体的残差注意力增强模型。
+
+    当前最佳 D1 使用原始 HCCR9Layer，这个增强版本暂未用于正式成绩。
+    """
 
     def __init__(self, num_classes: int, dropout: float = 0.5) -> None:
         super().__init__(num_classes, dropout)
@@ -187,7 +197,10 @@ class HCCR9ResidualAttention(HCCR9Layer):
 
 
 class HCCR9ResidualAttentionWide(nn.Module):
-    """参数量受控的宽版九层残差注意力模型。"""
+    """参数量受控的宽版九层残差注意力模型。
+
+    这是预留的宽模型实验版本，当前最佳 D1 没有使用它。
+    """
 
     def __init__(self, num_classes: int, dropout: float = 0.5) -> None:
         super().__init__()
@@ -247,10 +260,12 @@ def create_model(name: str, num_classes: int) -> nn.Module:
     normalized = name.lower().strip().replace("-", "_")
     if normalized in {"hccr_cnn9", "hccr_cnn9layer", "hccr9"}:
         return HCCR9Layer(num_classes)
+    # 当前最佳 D1 不走以下增强模型分支；它们保留给后续对照实验。
     if normalized in {"hccr_cnn9_ra", "hccr9_ra"}:
         return HCCR9ResidualAttention(num_classes)
     if normalized in {"hccr_cnn9_ra_wide", "hccr9_ra_wide"}:
         return HCCR9ResidualAttentionWide(num_classes)
+    # 旧轻量 CNN 仅用于兼容旧 checkpoint，当前最佳 D1 不使用。
     if normalized in {"cnn", "handwritten_cnn"}:
         return HandwrittenCNN(num_classes)
     raise ValueError(

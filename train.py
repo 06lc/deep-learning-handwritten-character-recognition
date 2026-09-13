@@ -210,8 +210,15 @@ def prepare_test_index(
         if test_index.class_names != class_names:
             raise ValueError("HWDB1.1 test labels do not match checkpoint class mapping")
     else:
-        cache_path = config.cache_dir / "test_hwdb10_shared.npz"
-        expected_files = gnt_files(config.hwdb10_test_root)
+        if config.test_profile == "hwdb10_shared":
+            test_root = config.hwdb10_test_root
+            cache_path = config.cache_dir / "test_hwdb10_shared.npz"
+        elif config.test_profile == "icdar2013":
+            test_root = config.competition_test_root
+            cache_path = config.cache_dir / "test_icdar2013.npz"
+        else:
+            raise ValueError(f"unsupported test profile: {config.test_profile}")
+        expected_files = gnt_files(test_root)
         test_index = None
         if not config.rebuild_index and cache_path.is_file():
             cached = load_index(cache_path)
@@ -222,7 +229,7 @@ def prepare_test_index(
                 test_index = cached
         if test_index is None:
             test_index = build_index(
-                config.hwdb10_test_root,
+                test_root,
                 class_names=class_names,
                 expected_num_classes=len(class_names),
                 unknown_label="skip",
@@ -235,6 +242,7 @@ def prepare_test_index(
         "test_accepted_samples": stats.accepted_samples if stats else len(test_index.records),
         "test_excluded_samples": stats.excluded_samples if stats else 0,
         "test_excluded_class_names": list(stats.excluded_class_names) if stats else [],
+        "test_class_count": len(stats.shared_class_names) if stats else len(class_names),
     }
 
 
@@ -748,6 +756,7 @@ def evaluate_checkpoint(
         train_roots=config.train_roots,
         test_root=config.test_root,
         hwdb10_test_root=config.hwdb10_test_root,
+        competition_test_root=config.competition_test_root,
         cache_dir=config.cache_dir,
         output_dir=config.output_dir,
         model_name=str(payload.get("model_name", "cnn")),

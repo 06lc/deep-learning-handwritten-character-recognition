@@ -42,6 +42,7 @@ checkpoint：outputs/data-expansion/d1-warm/best.pt
 项目目录/Gnt1.0TrainPart2  # 112 个 GNT 文件，可选扩充数据
 项目目录/Gnt1.0TrainPart3  # 112 个 GNT 文件，可选扩充数据
 项目目录/Gnt1.0Test        # 84 个 GNT 文件，仅作外部测试
+项目目录/competition-gnt   # ICDAR-2013 比赛测试集，60 个 GNT 文件
 ```
 
 程序通过 `Path(__file__).resolve().parent` 自动定位项目目录，不依赖 `D:\`、`F:\` 或
@@ -146,8 +147,13 @@ python main.py train \
 ```bash
 python main.py evaluate --checkpoint outputs/best.pt --device cuda
 python main.py evaluate --checkpoint outputs/best.pt --test-profile hwdb10_shared --device cuda
+python main.py evaluate --checkpoint outputs/best.pt --test-profile icdar2013 --device cuda
 python main.py predict --checkpoint outputs/best.pt --input sample-pics/5.jpg --top-k 5
 ```
+
+`icdar2013` 使用论文对应的 ICDAR-2013 Offline HCCR Competition 测试集，
+索引单独保存为 `cache/test_icdar2013.npz`，不会覆盖 HWDB1.1 的 `cache/test.npz`，
+也不会进入训练或固定验证集。
 
 错误分析默认使用固定验证集，不会访问 Test：
 

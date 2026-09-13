@@ -21,6 +21,7 @@ from compression import (
 )
 from config import (
     CACHE_ROOT,
+    COMPETITION_TEST_ROOT,
     DATA_PROFILES,
     HWDB10_TEST_ROOT,
     HWDB10_TRAIN_ROOTS,
@@ -43,6 +44,7 @@ from train import (
     make_train_validation_loaders,
     prepare_indexes,
     prepare_indexes_with_report,
+    prepare_test_index,
     resolve_device,
     run_epoch,
 )
@@ -51,6 +53,7 @@ from train import (
 def _add_dataset_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--train-root", action="append", dest="train_roots", type=Path)
     parser.add_argument("--test-root", type=Path, default=TEST_ROOT)
+    parser.add_argument("--competition-test-root", type=Path, default=COMPETITION_TEST_ROOT)
     parser.add_argument("--cache-dir", type=Path, default=CACHE_ROOT)
 
 
@@ -118,6 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
     index_parser = subparsers.add_parser("index", help="build and validate GNT indexes")
     _add_dataset_arguments(index_parser)
     index_parser.add_argument("--data-profile", choices=DATA_PROFILES, default="hwdb11")
+    index_parser.add_argument("--test-profile", choices=TEST_PROFILES, default="hwdb11")
     index_parser.add_argument("--expected-num-classes", type=int, default=3926)
     index_parser.add_argument("--rebuild-index", action="store_true")
 
@@ -196,25 +200,31 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _dataset_roots(args: argparse.Namespace) -> tuple[tuple[Path, ...], Path, Path]:
+def _dataset_roots(args: argparse.Namespace) -> tuple[tuple[Path, ...], Path, Path, Path]:
     train_roots = tuple(args.train_roots) if args.train_roots else TRAIN_ROOTS
-    return train_roots, args.test_root, args.cache_dir
+    return train_roots, args.test_root, args.competition_test_root, args.cache_dir
 
 
 def _run_index(args: argparse.Namespace) -> int:
-    train_roots, test_root, cache_dir = _dataset_roots(args)
+    train_roots, test_root, competition_test_root, cache_dir = _dataset_roots(args)
     config = TrainConfig(
         train_roots=train_roots,
         test_root=test_root,
         additional_train_roots=HWDB10_TRAIN_ROOTS,
         hwdb10_test_root=HWDB10_TEST_ROOT,
+        competition_test_root=competition_test_root,
         cache_dir=cache_dir,
         data_profile=args.data_profile,
+        test_profile=args.test_profile,
         expected_num_classes=args.expected_num_classes,
         rebuild_index=args.rebuild_index,
     )
     validate_config_paths(config)
-    train_index, test_index, report = prepare_indexes_with_report(config)
+    train_index, primary_test_index, report = prepare_indexes_with_report(config)
+    test_index = primary_test_index
+    if config.test_profile != "hwdb11":
+        test_index, test_report = prepare_test_index(config, train_index.class_names)
+        report = {**report, **test_report}
     _, validation_indices = split_record_indices_by_file(
         train_index,
         config.val_fraction,
@@ -227,9 +237,12 @@ def _run_index(args: argparse.Namespace) -> int:
         "train_files": len(train_index.files),
         "train_samples": len(train_index.records),
         "test_files": len(test_index.files),
+        "test_samples": len(test_index.records),
         "validation_samples": len(validation_indices),
         "train_roots": [str(p.resolve()) for p in train_roots],
-        "test_root": str(test_root.resolve()),
+        "test_root": str(
+            (competition_test_root if args.test_profile == "icdar2013" else test_root).resolve()
+        ),
         "cache_dir": str(cache_dir.resolve()),
     }
     print(
@@ -243,12 +256,13 @@ def _run_index(args: argparse.Namespace) -> int:
 
 
 def _run_train(args: argparse.Namespace) -> int:
-    train_roots, test_root, cache_dir = _dataset_roots(args)
+    train_roots, test_root, competition_test_root, cache_dir = _dataset_roots(args)
     config = TrainConfig(
         train_roots=train_roots,
         test_root=test_root,
         additional_train_roots=HWDB10_TRAIN_ROOTS,
         hwdb10_test_root=HWDB10_TEST_ROOT,
+        competition_test_root=competition_test_root,
         cache_dir=cache_dir,
         output_dir=args.output_dir,
         data_profile=args.data_profile,
@@ -288,11 +302,12 @@ def _run_train(args: argparse.Namespace) -> int:
 
 
 def _run_evaluate(args: argparse.Namespace) -> int:
-    train_roots, test_root, cache_dir = _dataset_roots(args)
+    train_roots, test_root, competition_test_root, cache_dir = _dataset_roots(args)
     config = TrainConfig(
         train_roots=train_roots,
         test_root=test_root,
         hwdb10_test_root=HWDB10_TEST_ROOT,
+        competition_test_root=competition_test_root,
         cache_dir=cache_dir,
         test_profile=args.test_profile,
         batch_size=args.batch_size,
@@ -340,12 +355,13 @@ def _run_predict(args: argparse.Namespace) -> int:
 
 
 def _run_analyze(args: argparse.Namespace) -> int:
-    train_roots, test_root, cache_dir = _dataset_roots(args)
+    train_roots, test_root, competition_test_root, cache_dir = _dataset_roots(args)
     config = TrainConfig(
         train_roots=train_roots,
         test_root=test_root,
         additional_train_roots=HWDB10_TRAIN_ROOTS,
         hwdb10_test_root=HWDB10_TEST_ROOT,
+        competition_test_root=competition_test_root,
         cache_dir=cache_dir,
         data_profile=args.data_profile,
         test_profile=args.test_profile,
