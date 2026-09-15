@@ -38,7 +38,7 @@ def predict_image(
     except StopIteration:
         pass
     model.eval()
-    with torch.inference_mode():
+    with torch.inference_mode(): # 推理模式下，关闭梯度计算
         probabilities = torch.softmax(model(tensor)[0], dim=0)
     count = min(top_k, len(class_names))
     values, indices = probabilities.topk(count)

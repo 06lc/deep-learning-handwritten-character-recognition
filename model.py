@@ -57,7 +57,7 @@ class ResidualBlock(nn.Module):
 class HandwrittenCNN(nn.Module):
     """原项目的轻量模型，保留用于旧 checkpoint 兼容。
 
-    当前最佳 D1 模型不使用这个类；学习主流程时可以先跳过。
+    当前最佳 D1 模型不使用这个类
     """
 
     def __init__(self, num_classes: int, dropout: float = 0.2) -> None:
@@ -87,7 +87,7 @@ class HandwrittenCNN(nn.Module):
 
 
 class PaperConvBlock(nn.Module):
-    """论文中的 3x3 卷积、BN、PReLU 组合。
+    """ 3x3 卷积、BN、PReLU 组合。
 
     卷积负责从局部像素中提取笔画特征；BatchNorm 稳定数值分布；PReLU
     提供非线性，使网络可以表示弯钩、交叉和复杂部件等模式。
@@ -106,15 +106,15 @@ class PaperConvBlock(nn.Module):
 
 
 class HCCR9Layer(nn.Module):
-    """论文 HCCR-CNN9Layer 的 PyTorch 实现。
+    """ HCCR-CNN9Layer 的 PyTorch 实现。
 
-    论文将 7 个卷积层和 2 个全连接层合称 9-layer CNN。自适应池化保留了
-    96x96 的论文默认输入，同时允许测试使用较小图片。
+     7 个卷积层和 2 个全连接层  9-layer CNN。自适应池化保留了
+    96x96 的默认输入，同时允许测试使用较小图片。
     """
 
     def __init__(self, num_classes: int, dropout: float = 0.5) -> None:
         super().__init__()
-        if num_classes < 2:
+        if num_classes < 2:#确保模型至少有两个类别，否则分类任务没有意义。
             raise ValueError("num_classes must be at least 2")
         self.features = nn.Sequential(
             PaperConvBlock(1, 96),
@@ -265,7 +265,7 @@ def create_model(name: str, num_classes: int) -> nn.Module:
         return HCCR9ResidualAttention(num_classes)
     if normalized in {"hccr_cnn9_ra_wide", "hccr9_ra_wide"}:
         return HCCR9ResidualAttentionWide(num_classes)
-    # 旧轻量 CNN 仅用于兼容旧 checkpoint，当前最佳 D1 不使用。
+    # 旧轻量 CNN 仅用于兼容旧 checkpoint,当前最佳 D1 不使用。
     if normalized in {"cnn", "handwritten_cnn"}:
         return HandwrittenCNN(num_classes)
     raise ValueError(

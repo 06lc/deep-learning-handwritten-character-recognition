@@ -31,12 +31,12 @@ class DatasetFormatError(ValueError):
 class GNTRecord:
     """一个 GNT 样本在源文件中的位置和元数据。"""
 
-    file_id: int
-    offset: int
-    sample_size: int
-    width: int
-    height: int
-    label: int
+    file_id: int # GNT 文件在文件列表中的索引
+    offset: int # 样本在 GNT 文件中的偏移量
+    sample_size: int # 样本在 GNT 文件中的总长度
+    width: int # 图像宽度
+    height: int # 图像高度
+    label: int # 样本标签，即类别编号
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,7 +71,7 @@ def decode_label(raw_label: bytes) -> str:
     """
 
     try:
-        label = raw_label.decode("gbk").rstrip("\x00")
+        label = raw_label.decode("gbk").rstrip("\x00")#转中文
     except UnicodeDecodeError as exc:
         raise DatasetFormatError(f"invalid GBK label bytes: {raw_label!r}") from exc
     if not label:
@@ -287,7 +287,7 @@ def split_record_indices_by_file(
     manifest_path: str | Path | None = None,
     roots: Sequence[str | Path] | None = None,
 ) -> tuple[list[int], list[int]]:
-    """按 GNT 文件切分训练/验证样本，避免书写者风格泄漏。"""
+    """按 GNT 文件切分训练/验证样本，避免书写者风格泄漏 。"""
 
     if not 0 < validation_fraction < 1:
         raise ValueError("validation_fraction must be between 0 and 1")
