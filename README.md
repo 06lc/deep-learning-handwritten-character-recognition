@@ -148,7 +148,7 @@ python main.py train \
 python main.py evaluate --checkpoint outputs/best.pt --device cuda
 python main.py evaluate --checkpoint outputs/best.pt --test-profile hwdb10_shared --device cuda
 python main.py evaluate --checkpoint outputs/best.pt --test-profile icdar2013 --device cuda
-python main.py predict --checkpoint outputs/best.pt --input sample-pics/5.jpg --top-k 5
+python main.py predict --checkpoint outputs/best.pt --input path/to/your-image.jpg --top-k 5
 ```
 
 `icdar2013` 使用论文对应的 ICDAR-2013 Offline HCCR Competition 测试集，
